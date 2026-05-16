@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
@@ -18,24 +19,40 @@ namespace Glacier.Vector.Mcp
         private readonly StreamReader _reader;
         private readonly StreamWriter _writer;
 
-        // Use a static JsonSerializerOptions to prevent allocation overhead
         private static readonly JsonSerializerOptions JsonOpts = new()
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
+        private readonly string _logPath;
+
+        private void Log(string message)
+        {
+            try
+            {
+                File.AppendAllText(_logPath, $"[{DateTime.Now:T}] {message}\n");
+            }
+            catch { /* Ignore logging errors */ }
+        }
+
         public McpServer(VectorIndex index)
         {
             _index = index ?? throw new ArgumentNullException(nameof(index));
+            _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mcp_log.txt");
+
+            Log("Server instance created.");
 
             // Setup standard IO for MCP communication
             Stream openStandardInput = Console.OpenStandardInput();
             _reader = new StreamReader(openStandardInput);
 
             Stream openStandardOutput = Console.OpenStandardOutput();
-            // AutoFlush is critical for MCP, otherwise the AI host will hang waiting for the response
-            _writer = new StreamWriter(openStandardOutput) { AutoFlush = true };
+            // Use UTF8 without BOM (important for some MCP hosts)
+            _writer = new StreamWriter(openStandardOutput, new UTF8Encoding(false)) { AutoFlush = true };
+            _writer.NewLine = "\n";
+            
+            Log("IO setup complete.");
         }
 
         public async Task RunAsync()
@@ -45,41 +62,79 @@ namespace Glacier.Vector.Mcp
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
+                JsonElement requestId = default;
                 try
                 {
-                    var request = JsonSerializer.Deserialize<RpcRequest>(line, JsonOpts);
-                    if (request == null) continue;
+                    Log($"Received: {line}");
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+
+                    if (!root.TryGetProperty("method", out JsonElement methodElem))
+                    {
+                        Log("Message missing 'method' property.");
+                        continue;
+                    }
+
+                    string method = methodElem.GetString() ?? "";
+                    root.TryGetProperty("id", out requestId);
+
+                    Log($"Method: {method}");
 
                     // Route the MCP Methods
-                    switch (request.Method)
+                    switch (method)
                     {
                         case "initialize":
-                            await SendResponseAsync(request.Id, HandleInitialize());
+                            await SendResponseAsync(requestId, HandleInitialize());
                             break;
 
                         case "notifications/initialized":
-                            // Client acknowledges initialization; no response needed
+                            Log("Initialized notification received.");
+                            break;
+
+                        case "notifications/cancelled":
+                            Log("Client cancelled a request.");
                             break;
 
                         case "tools/list":
-                            await SendResponseAsync(request.Id, HandleToolsList());
+                            await SendResponseAsync(requestId, HandleToolsList());
                             break;
 
                         case "tools/call":
-                            var result = HandleToolCall(request.Params);
-                            await SendResponseAsync(request.Id, result);
+                            try
+                            {
+                                if (root.TryGetProperty("params", out JsonElement parameters))
+                                {
+                                    var result = await HandleToolCallAsync(parameters);
+                                    await SendResponseAsync(requestId, result);
+                                }
+                                else
+                                {
+                                    await SendErrorAsync(requestId, -32602, "Missing parameters for tools/call");
+                                }
+                            }
+                            catch (Exception toolEx)
+                            {
+                                Log($"Tool execution error: {toolEx.Message}");
+                                await SendErrorAsync(requestId, -32000, toolEx.Message);
+                            }
                             break;
 
                         default:
-                            // Method not found
-                            await SendErrorAsync(request.Id, -32601, $"Method '{request.Method}' not found.");
+                            Log($"Method '{method}' not handled.");
+                            if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
+                            {
+                                await SendErrorAsync(requestId, -32601, $"Method '{method}' not found.");
+                            }
                             break;
                     }
                 }
                 catch (Exception ex)
                 {
-                    // Log to stderr so we don't break the stdout JSON protocol
-                    Console.Error.WriteLine($"[MCP Error] {ex.Message}");
+                    Log($"CRITICAL ERROR: {ex.Message}\n{ex.StackTrace}");
+                    if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
+                    {
+                        try { await SendErrorAsync(requestId, -32603, "Internal server error."); } catch { }
+                    }
                 }
             }
         }
@@ -98,48 +153,89 @@ namespace Glacier.Vector.Mcp
         {
             return new
             {
-                tools = new object[]
+                tools = new[]
                 {
-                    new
+                    new Dictionary<string, object>
                     {
-                        name = "add_vector",
-                        description = "Adds a new vector and its associated text/metadata to the database.",
-                        inputSchema = new
-                        {
-                            type = "object",
-                            properties = new
+                        { "name", "add_vector" },
+                        { "description", "Adds a new vector and its associated text/metadata to the database." },
+                        { "inputSchema", new Dictionary<string, object>
                             {
-                                vector = new { type = "array", items = new { type = "number" }, description = "The embedding vector (e.g., 1536 floats)." },
-                                metadata = new { type = "string", description = "The text or JSON metadata associated with this vector." }
-                            },
-                            required = new[] { "vector", "metadata" }
+                                { "type", "object" },
+                                { "properties", new Dictionary<string, object>
+                                    {
+                                        { "vector", new Dictionary<string, object>
+                                            {
+                                                { "type", "array" },
+                                                { "items", new Dictionary<string, object> { { "type", "number" } } },
+                                                { "description", "The embedding vector (e.g., 1536 floats)." }
+                                            }
+                                        },
+                                        { "metadata", new Dictionary<string, object>
+                                            {
+                                                { "type", "string" },
+                                                { "description", "The text or JSON metadata associated with this vector." }
+                                            }
+                                        }
+                                    }
+                                },
+                                { "required", new[] { "vector", "metadata" } }
+                            }
                         }
                     },
-                    new
+                    new Dictionary<string, object>
                     {
-                        name = "search_vectors",
-                        description = "Searches the vector database for the closest semantic matches to a query vector.",
-                        inputSchema = new
-                        {
-                            type = "object",
-                            properties = new
+                        { "name", "search_vectors" },
+                        { "description", "Searches the vector database for the closest semantic matches to a query vector." },
+                        { "inputSchema", new Dictionary<string, object>
                             {
-                                query = new { type = "array", items = new { type = "number" }, description = "The query embedding vector." },
-                                top_k = new { type = "integer", description = "The number of results to return (default 5)." }
-                            },
-                            required = new[] { "query" }
+                                { "type", "object" },
+                                { "properties", new Dictionary<string, object>
+                                    {
+                                        { "query", new Dictionary<string, object>
+                                            {
+                                                { "type", "array" },
+                                                { "items", new Dictionary<string, object> { { "type", "number" } } },
+                                                { "description", "The query embedding vector." }
+                                            }
+                                        },
+                                        { "top_k", new Dictionary<string, object>
+                                            {
+                                                { "type", "integer" },
+                                                { "description", "The number of results to return (default 5)." }
+                                            }
+                                        }
+                                    }
+                                },
+                                { "required", new[] { "query" } }
+                            }
+                        }
+                    },
+                    new Dictionary<string, object>
+                    {
+                        { "name", "ping" },
+                        { "description", "A simple ping tool to verify the server is responding." },
+                        { "inputSchema", new Dictionary<string, object>
+                            {
+                                { "type", "object" },
+                                { "properties", new Dictionary<string, object>() }
+                            }
                         }
                     }
                 }
             };
         }
 
-        private object HandleToolCall(JsonElement parameters)
+        private async Task<object> HandleToolCallAsync(JsonElement parameters)
         {
             string name = parameters.GetProperty("name").GetString() ?? "";
             JsonElement args = parameters.GetProperty("arguments");
 
-            if (name == "add_vector")
+            if (name == "ping")
+            {
+                return CreateToolResponse("pong");
+            }
+            else if (name == "add_vector")
             {
                 float[] vector = JsonSerializer.Deserialize<float[]>(args.GetProperty("vector").GetRawText())!;
                 string metadata = args.GetProperty("metadata").GetString() ?? "";
@@ -186,19 +282,37 @@ namespace Glacier.Vector.Mcp
 
         private async Task SendResponseAsync(JsonElement id, object result)
         {
-            var response = new RpcResponse { Id = id, Result = result };
+            var response = new Dictionary<string, object>
+            {
+                ["jsonrpc"] = "2.0",
+                ["result"] = result
+            };
+
+            if (id.ValueKind != JsonValueKind.Undefined)
+            {
+                response["id"] = id;
+            }
+
             string json = JsonSerializer.Serialize(response, JsonOpts);
+            Log($"Sending response: {json}");
             await _writer.WriteLineAsync(json);
         }
 
         private async Task SendErrorAsync(JsonElement id, int code, string message)
         {
-            var response = new RpcResponse
+            var response = new Dictionary<string, object>
             {
-                Id = id,
-                Error = new { code, message }
+                ["jsonrpc"] = "2.0",
+                ["error"] = new { code, message }
             };
+
+            if (id.ValueKind != JsonValueKind.Undefined)
+            {
+                response["id"] = id;
+            }
+
             string json = JsonSerializer.Serialize(response, JsonOpts);
+            Log($"Sending error: {json}");
             await _writer.WriteLineAsync(json);
         }
 
