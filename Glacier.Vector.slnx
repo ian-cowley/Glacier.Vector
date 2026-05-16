@@ -2,6 +2,9 @@
   <Folder Name="/samples/">
     <Project Path="samples/Glacier.Vector.Demo/Glacier.Vector.Demo.csproj" />
   </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Glacier.Vector.Host/Glacier.Vector.Host.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj" />
   </Folder>
