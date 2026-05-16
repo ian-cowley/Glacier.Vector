@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Glacier.Vector.Demo/Glacier.Vector.Demo.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj" />
+  </Folder>
+  <Project Path="src/Glacier.Vector/Glacier.Vector.csproj" />
+</Solution>

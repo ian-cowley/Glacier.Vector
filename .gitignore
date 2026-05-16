@@ -1,0 +1,39 @@
+# Build output folders
+[Bb]in/
+[Oo]bj/
+[Rr]elease/
+
+# IDE and editor folders
+.vs/
+.idea/
+.vscode/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+*.DotSettings
+
+# AI assistant artifacts
+.gemini/
+
+# BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
+
+# NuGet
+*.nupkg
+packages/
+
+# Logs
+*.log
+ncrunch*
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Scratch / working directories
+brain/
+scratch/

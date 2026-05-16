@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- NuGet Packaging Properties -->
+    <Version>1.0.0</Version>
+    <PackageId>Glacier.Vector</PackageId>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier</Company>
+    <Description>High-performance, SIMD-accelerated vector search engine and index for .NET 10. Built for speed and efficiency with zero-copy semantics and MCP support.</Description>
+    <PackageTags>vector-search embeddings simd dotnet csharp high-performance semantic-search mcp</PackageTags>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Vector</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- High Performance Optimizations -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <LangVersion>preview</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
