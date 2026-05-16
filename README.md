@@ -61,6 +61,43 @@ foreach (var hit in results)
 
 ---
 
+## MCP Server Setup
+
+Glacier.Vector includes a built-in MCP (Model Context Protocol) server host, allowing you to use your vector database as a tool for AI agents (like Claude or Antigravity).
+
+### 1. Build the Server
+First, build the host application in Release mode:
+
+```bash
+dotnet build src/Glacier.Vector.Host/Glacier.Vector.Host.csproj -c Release
+```
+
+### 2. Configure Your Client
+Add the following entry to your `mcp_config.json` (usually located in `%AppData%\Roaming\Claude\claude_desktop_config.json` or your agent's config directory):
+
+```json
+{
+  "mcpServers": {
+    "glacier-vector": {
+      "command": "dotnet",
+      "args": [
+        "ABS_PATH_TO_REPO/src/Glacier.Vector.Host/bin/Release/net10.0/Glacier.Vector.Host.dll"
+      ]
+    }
+  }
+}
+```
+
+### 3. Available Tools
+
+- **`add_vector`**: Adds a 1536-dimensional vector and associated metadata to the index.
+- **`search_vectors`**: Performs a semantic search for the closest matches to a query vector.
+- **`ping`**: Simple health check to verify the server is responding.
+
+The server defaults to 1536 dimensions, optimized for modern LLM embedding models.
+
+---
+
 ## Performance
 
 Glacier.Vector is designed to saturate your CPU's memory bandwidth during search operations. On modern hardware, it can scan millions of vectors per second using SIMD-optimized kernels.
