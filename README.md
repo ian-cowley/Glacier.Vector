@@ -1,7 +1,11 @@
 # Glacier.Vector
 
+[![DEV.to Story](https://img.shields.io/badge/DEV.to-Story-0a0a0a?style=for-the-badge&logo=devto&logoColor=white)](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Vector.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Vector/)
 [![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Vector.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Vector/)
+
+> 📖 **Read the Deep-Dive**: **[I built a zero-dependency C# vector database that saturates DDR5 RAM bandwidth.](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a)**
+
 
 **Glacier.Vector** is a high-performance, SIMD-accelerated vector search engine and index for .NET 10. Built for speed and efficiency, it provides a zero-copy architecture for storing and querying high-dimensional embeddings, commonly used in LLM-powered applications and semantic search.
 
