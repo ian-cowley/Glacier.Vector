@@ -4,7 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- NuGet Packaging Properties -->
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <PackageId>Glacier.Vector</PackageId>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier</Company>

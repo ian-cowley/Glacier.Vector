@@ -239,7 +239,9 @@ namespace Glacier.Vector.Storage
         private int _accessCounter = 0;
 
         [ThreadStatic]
-        private static float[]? _threadLocalBuffer;
+        private static float[][]? _threadLocalBuffers;
+        [ThreadStatic]
+        private static int _bufferIndex;
 
         public PagedVectorStorage(string filePath, int dimensions, int maxMemoryBytes = 256 * 1024)
         {
@@ -318,10 +320,19 @@ namespace Glacier.Vector.Storage
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<float> GetVector(int index)
         {
-            if (_threadLocalBuffer == null || _threadLocalBuffer.Length < Dimensions)
+            if (_threadLocalBuffers == null)
             {
-                _threadLocalBuffer = new float[Dimensions];
+                _threadLocalBuffers = new float[4][];
             }
+
+            _bufferIndex = (_bufferIndex + 1) & 3;
+
+            if (_threadLocalBuffers[_bufferIndex] == null || _threadLocalBuffers[_bufferIndex].Length < Dimensions)
+            {
+                _threadLocalBuffers[_bufferIndex] = new float[Dimensions];
+            }
+
+            float[] buffer = _threadLocalBuffers[_bufferIndex];
 
             long byteOffset = (long)index * Dimensions * sizeof(float);
             long pageIndex = byteOffset / _pageSize;
@@ -331,10 +342,10 @@ namespace Glacier.Vector.Storage
             {
                 ReadOnlySpan<byte> pageSpan = GetPage(pageIndex);
                 var floatSpan = MemoryMarshal.Cast<byte, float>(pageSpan.Slice(inPageOffset, Dimensions * sizeof(float)));
-                floatSpan.CopyTo(_threadLocalBuffer);
+                floatSpan.CopyTo(buffer);
             }
 
-            return _threadLocalBuffer.AsSpan(0, Dimensions);
+            return buffer.AsSpan(0, Dimensions);
         }
 
         public void Append(ReadOnlySpan<float> vector)
