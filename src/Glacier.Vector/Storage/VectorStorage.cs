@@ -1,8 +1,10 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Glacier.Vector.Storage
 {
@@ -213,6 +215,163 @@ namespace Glacier.Vector.Storage
             long exactBytes = (long)Count * Dimensions * sizeof(float);
             _fileStream?.SetLength(exactBytes);
             _fileStream?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Disk-backed storage using a software-controlled LRU page cache.
+    /// Enforces a strict memory limit, making it ideal for low-memory or embedded systems.
+    /// </summary>
+    public class PagedVectorStorage : IVectorStorage
+    {
+        public int Dimensions { get; }
+        public int Count { get; private set; }
+
+        private readonly string _filePath;
+        private readonly FileStream _fileStream;
+        private readonly object _lock = new object();
+
+        // Software page cache parameters
+        private readonly int _pageSize;
+        private readonly byte[][] _pages;
+        private readonly long[] _pageTags;
+        private readonly int[] _pageAccess;
+        private int _accessCounter = 0;
+
+        [ThreadStatic]
+        private static float[]? _threadLocalBuffer;
+
+        public PagedVectorStorage(string filePath, int dimensions, int maxMemoryBytes = 256 * 1024)
+        {
+            Dimensions = dimensions;
+            _filePath = filePath;
+
+            int bytesPerVector = dimensions * sizeof(float);
+            // Align page size to be a multiple of vector size, >= 4096 bytes
+            _pageSize = Math.Max(4096, ((4096 + bytesPerVector - 1) / bytesPerVector) * bytesPerVector);
+
+            bool fileExists = File.Exists(filePath);
+            _fileStream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.RandomAccess);
+
+            if (fileExists && _fileStream.Length > 0)
+            {
+                Count = (int)(_fileStream.Length / bytesPerVector);
+            }
+            else
+            {
+                Count = 0;
+            }
+
+            // Initialize Page Cache
+            int numPages = Math.Max(1, maxMemoryBytes / _pageSize);
+            _pages = new byte[numPages][];
+            for (int i = 0; i < numPages; i++) _pages[i] = new byte[_pageSize];
+            _pageTags = new long[numPages];
+            Array.Fill(_pageTags, -1);
+            _pageAccess = new int[numPages];
+        }
+
+        private ReadOnlySpan<byte> GetPage(long pageIndex)
+        {
+            int cacheSlot = -1;
+            int lruSlot = 0;
+            int minAccess = int.MaxValue;
+
+            for (int i = 0; i < _pageTags.Length; i++)
+            {
+                if (_pageTags[i] == pageIndex)
+                {
+                    cacheSlot = i;
+                    break;
+                }
+                if (_pageAccess[i] < minAccess)
+                {
+                    minAccess = _pageAccess[i];
+                    lruSlot = i;
+                }
+            }
+
+            if (cacheSlot == -1)
+            {
+                // Cache miss: evict LRU slot and load new page from disk
+                cacheSlot = lruSlot;
+                _pageTags[cacheSlot] = pageIndex;
+                long fileOffset = pageIndex * _pageSize;
+
+                long remainingBytes = _fileStream.Length - fileOffset;
+                int bytesToRead = (int)Math.Min(_pageSize, remainingBytes);
+
+                if (bytesToRead > 0)
+                {
+                    RandomAccess.Read(_fileStream.SafeFileHandle, _pages[cacheSlot].AsSpan(0, bytesToRead), fileOffset);
+                }
+                if (bytesToRead < _pageSize)
+                {
+                    _pages[cacheSlot].AsSpan(bytesToRead).Clear();
+                }
+            }
+
+            _pageAccess[cacheSlot] = ++_accessCounter;
+            return _pages[cacheSlot];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ReadOnlySpan<float> GetVector(int index)
+        {
+            if (_threadLocalBuffer == null || _threadLocalBuffer.Length < Dimensions)
+            {
+                _threadLocalBuffer = new float[Dimensions];
+            }
+
+            long byteOffset = (long)index * Dimensions * sizeof(float);
+            long pageIndex = byteOffset / _pageSize;
+            int inPageOffset = (int)(byteOffset % _pageSize);
+
+            lock (_lock)
+            {
+                ReadOnlySpan<byte> pageSpan = GetPage(pageIndex);
+                var floatSpan = MemoryMarshal.Cast<byte, float>(pageSpan.Slice(inPageOffset, Dimensions * sizeof(float)));
+                floatSpan.CopyTo(_threadLocalBuffer);
+            }
+
+            return _threadLocalBuffer.AsSpan(0, Dimensions);
+        }
+
+        public void Append(ReadOnlySpan<float> vector)
+        {
+            if (vector.Length != Dimensions)
+                throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
+
+            int bytesPerVector = Dimensions * sizeof(float);
+            long fileOffset = (long)Count * bytesPerVector;
+
+            lock (_lock)
+            {
+                // Write vector directly to disk
+                var byteSpan = MemoryMarshal.AsBytes(vector);
+                RandomAccess.Write(_fileStream.SafeFileHandle, byteSpan, fileOffset);
+
+                // Invalidate any page in the cache that covers this offset
+                long pageIndex = fileOffset / _pageSize;
+                for (int i = 0; i < _pageTags.Length; i++)
+                {
+                    if (_pageTags[i] == pageIndex)
+                    {
+                        _pageTags[i] = -1; // Invalidate cache slot
+                        break;
+                    }
+                }
+
+                Count++;
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                _fileStream?.Dispose();
+            }
         }
     }
 }
