@@ -16,8 +16,6 @@ We take the security of Glacier.Vector seriously. If you believe you have found 
 2. Click the **Report a vulnerability** button to submit a private draft advisory.
 3. Fill out the details of the vulnerability.
 
-Alternatively, you can email the maintainers directly.
-
 Please do not report security vulnerabilities via public GitHub issues.
 
 ### What to include in your report:
