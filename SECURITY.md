@@ -12,8 +12,11 @@ We currently support the following versions of Glacier.Vector:
 
 We take the security of Glacier.Vector seriously. If you believe you have found a security vulnerability, please report it to us by:
 
-1.  Opening a **Private Issue** on GitHub (if available).
-2.  Or emailing the maintainers directly.
+1. Navigate to the **Security** tab of the repository on GitHub.
+2. Click the **Report a vulnerability** button to submit a private draft advisory.
+3. Fill out the details of the vulnerability.
+
+Alternatively, you can email the maintainers directly.
 
 Please do not report security vulnerabilities via public GitHub issues.
 
