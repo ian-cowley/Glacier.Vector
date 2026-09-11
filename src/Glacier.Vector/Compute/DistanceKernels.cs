@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
@@ -37,10 +37,10 @@ namespace Glacier.Vector.Compute
 
                     for (; i <= length - 64; i += 64)
                     {
-                        acc0 = Vector512.Add(acc0, Vector512.Multiply(Vector512.Load(pTarget + i), Vector512.Load(pDb + i)));
-                        acc1 = Vector512.Add(acc1, Vector512.Multiply(Vector512.Load(pTarget + i + 16), Vector512.Load(pDb + i + 16)));
-                        acc2 = Vector512.Add(acc2, Vector512.Multiply(Vector512.Load(pTarget + i + 32), Vector512.Load(pDb + i + 32)));
-                        acc3 = Vector512.Add(acc3, Vector512.Multiply(Vector512.Load(pTarget + i + 48), Vector512.Load(pDb + i + 48)));
+                        acc0 = Avx512F.FusedMultiplyAdd(Vector512.Load(pTarget + i), Vector512.Load(pDb + i), acc0);
+                        acc1 = Avx512F.FusedMultiplyAdd(Vector512.Load(pTarget + i + 16), Vector512.Load(pDb + i + 16), acc1);
+                        acc2 = Avx512F.FusedMultiplyAdd(Vector512.Load(pTarget + i + 32), Vector512.Load(pDb + i + 32), acc2);
+                        acc3 = Avx512F.FusedMultiplyAdd(Vector512.Load(pTarget + i + 48), Vector512.Load(pDb + i + 48), acc3);
                     }
                     var sum1 = Vector512.Add(acc0, acc1);
                     var sum2 = Vector512.Add(acc2, acc3);
@@ -80,7 +80,30 @@ namespace Glacier.Vector.Compute
                     dotProduct += Vector256.Sum(Vector256.Add(sum1, sum2));
                 }
 
-                // 3. Scalar Cleanup (Catches remaining dimensions, e.g. for D=1536, this is skipped!)
+                // Remainder 16-float chunk for AVX-512
+                if (Avx512F.IsSupported && i <= length - 16)
+                {
+                    var acc = Vector512<float>.Zero;
+                    for (; i <= length - 16; i += 16)
+                    {
+                        acc = Avx512F.FusedMultiplyAdd(Vector512.Load(pTarget + i), Vector512.Load(pDb + i), acc);
+                    }
+                    dotProduct += Vector512.Sum(acc);
+                }
+                // Remainder 8-float chunk for AVX2
+                else if (Avx2.IsSupported && i <= length - 8)
+                {
+                    var acc = Vector256<float>.Zero;
+                    for (; i <= length - 8; i += 8)
+                    {
+                        acc = Fma.IsSupported 
+                            ? Fma.MultiplyAdd(Vector256.Load(pTarget + i), Vector256.Load(pDb + i), acc)
+                            : Vector256.Add(acc, Vector256.Multiply(Vector256.Load(pTarget + i), Vector256.Load(pDb + i)));
+                    }
+                    dotProduct += Vector256.Sum(acc);
+                }
+
+                // 3. Scalar Cleanup
                 for (; i < length; i++)
                 {
                     dotProduct += pTarget[i] * pDb[i];
@@ -105,23 +128,95 @@ namespace Glacier.Vector.Compute
             {
                 int i = 0;
 
-                if (Avx512F.IsSupported && length >= 16)
+                // 1. AVX-512 Fast Path Unrolled (64 floats per iteration)
+                if (Avx512F.IsSupported && length >= 64)
+                {
+                    var acc0 = Vector512<float>.Zero;
+                    var acc1 = Vector512<float>.Zero;
+                    var acc2 = Vector512<float>.Zero;
+                    var acc3 = Vector512<float>.Zero;
+
+                    for (; i <= length - 64; i += 64)
+                    {
+                        var diff0 = Vector512.Subtract(Vector512.Load(pTarget + i), Vector512.Load(pDb + i));
+                        var diff1 = Vector512.Subtract(Vector512.Load(pTarget + i + 16), Vector512.Load(pDb + i + 16));
+                        var diff2 = Vector512.Subtract(Vector512.Load(pTarget + i + 32), Vector512.Load(pDb + i + 32));
+                        var diff3 = Vector512.Subtract(Vector512.Load(pTarget + i + 48), Vector512.Load(pDb + i + 48));
+
+                        acc0 = Avx512F.FusedMultiplyAdd(diff0, diff0, acc0);
+                        acc1 = Avx512F.FusedMultiplyAdd(diff1, diff1, acc1);
+                        acc2 = Avx512F.FusedMultiplyAdd(diff2, diff2, acc2);
+                        acc3 = Avx512F.FusedMultiplyAdd(diff3, diff3, acc3);
+                    }
+                    var sum1 = Vector512.Add(acc0, acc1);
+                    var sum2 = Vector512.Add(acc2, acc3);
+                    distance += Vector512.Sum(Vector512.Add(sum1, sum2));
+                }
+                // 2. AVX2 / FMA Fast Path Unrolled (32 floats per iteration)
+                else if (Avx2.IsSupported && length >= 32)
+                {
+                    var acc0 = Vector256<float>.Zero;
+                    var acc1 = Vector256<float>.Zero;
+                    var acc2 = Vector256<float>.Zero;
+                    var acc3 = Vector256<float>.Zero;
+
+                    if (Fma.IsSupported)
+                    {
+                        for (; i <= length - 32; i += 32)
+                        {
+                            var diff0 = Vector256.Subtract(Vector256.Load(pTarget + i), Vector256.Load(pDb + i));
+                            var diff1 = Vector256.Subtract(Vector256.Load(pTarget + i + 8), Vector256.Load(pDb + i + 8));
+                            var diff2 = Vector256.Subtract(Vector256.Load(pTarget + i + 16), Vector256.Load(pDb + i + 16));
+                            var diff3 = Vector256.Subtract(Vector256.Load(pTarget + i + 24), Vector256.Load(pDb + i + 24));
+
+                            acc0 = Fma.MultiplyAdd(diff0, diff0, acc0);
+                            acc1 = Fma.MultiplyAdd(diff1, diff1, acc1);
+                            acc2 = Fma.MultiplyAdd(diff2, diff2, acc2);
+                            acc3 = Fma.MultiplyAdd(diff3, diff3, acc3);
+                        }
+                    }
+                    else
+                    {
+                        for (; i <= length - 32; i += 32)
+                        {
+                            var diff0 = Vector256.Subtract(Vector256.Load(pTarget + i), Vector256.Load(pDb + i));
+                            var diff1 = Vector256.Subtract(Vector256.Load(pTarget + i + 8), Vector256.Load(pDb + i + 8));
+                            var diff2 = Vector256.Subtract(Vector256.Load(pTarget + i + 16), Vector256.Load(pDb + i + 16));
+                            var diff3 = Vector256.Subtract(Vector256.Load(pTarget + i + 24), Vector256.Load(pDb + i + 24));
+
+                            acc0 = Vector256.Add(acc0, Vector256.Multiply(diff0, diff0));
+                            acc1 = Vector256.Add(acc1, Vector256.Multiply(diff1, diff1));
+                            acc2 = Vector256.Add(acc2, Vector256.Multiply(diff2, diff2));
+                            acc3 = Vector256.Add(acc3, Vector256.Multiply(diff3, diff3));
+                        }
+                    }
+
+                    var sum1 = Vector256.Add(acc0, acc1);
+                    var sum2 = Vector256.Add(acc2, acc3);
+                    distance += Vector256.Sum(Vector256.Add(sum1, sum2));
+                }
+
+                // Remainder 16-float chunk for AVX-512
+                if (Avx512F.IsSupported && i <= length - 16)
                 {
                     var acc = Vector512<float>.Zero;
                     for (; i <= length - 16; i += 16)
                     {
                         var diff = Vector512.Subtract(Vector512.Load(pTarget + i), Vector512.Load(pDb + i));
-                        acc = Vector512.Add(acc, Vector512.Multiply(diff, diff));
+                        acc = Avx512F.FusedMultiplyAdd(diff, diff, acc);
                     }
                     distance += Vector512.Sum(acc);
                 }
-                else if (Avx2.IsSupported && length >= 8)
+                // Remainder 8-float chunk for AVX2
+                else if (Avx2.IsSupported && i <= length - 8)
                 {
                     var acc = Vector256<float>.Zero;
                     for (; i <= length - 8; i += 8)
                     {
                         var diff = Vector256.Subtract(Vector256.Load(pTarget + i), Vector256.Load(pDb + i));
-                        acc = Vector256.Add(acc, Vector256.Multiply(diff, diff));
+                        acc = Fma.IsSupported 
+                            ? Fma.MultiplyAdd(diff, diff, acc)
+                            : Vector256.Add(acc, Vector256.Multiply(diff, diff));
                     }
                     distance += Vector256.Sum(acc);
                 }

@@ -88,5 +88,89 @@ namespace Glacier.Vector.Tests
                 Assert.Equal("Doc A", results[1].Metadata);
             }
         }
+
+        [Fact]
+        public void TestDistanceKernelsAccuracy()
+        {
+            const int dims = 135; // Non-multiple of 16/32/64 to test unrolling + tail
+            var rng = new Random(42);
+            float[] a = new float[dims];
+            float[] b = new float[dims];
+            double expectedDot = 0;
+            double expectedL2 = 0;
+
+            for (int i = 0; i < dims; i++)
+            {
+                a[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+                b[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+                expectedDot += a[i] * b[i];
+                float diff = a[i] - b[i];
+                expectedL2 += diff * diff;
+            }
+
+            float actualDot = Glacier.Vector.Compute.DistanceKernels.DotProduct(a, b);
+            float actualL2 = Glacier.Vector.Compute.DistanceKernels.L2DistanceSquared(a, b);
+
+            Assert.True(Math.Abs(actualDot - (float)expectedDot) < 1e-4f,
+                $"DotProduct mismatch: expected {expectedDot:F6}, got {actualDot:F6}");
+            Assert.True(Math.Abs(actualL2 - (float)expectedL2) < 1e-4f,
+                $"L2DistanceSquared mismatch: expected {expectedL2:F6}, got {actualL2:F6}");
+        }
+
+        [Fact]
+        public void TestVectorConcurrency()
+        {
+            int initial = Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism;
+            try
+            {
+                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = 0;
+                Assert.True(Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism() >= 1);
+
+                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = 4;
+                Assert.Equal(Math.Min(4, Environment.ProcessorCount), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism());
+
+                Assert.Equal(2, Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism(requested: 2));
+
+                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = -1;
+                Assert.Equal(Math.Max(1, Environment.ProcessorCount - 2), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism());
+            }
+            finally
+            {
+                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = initial;
+            }
+        }
+
+        [Fact]
+        public void TestVectorIndexParallelSearchConsistency()
+        {
+            const int dims = 64;
+            const int count = 500;
+            var rng = new Random(123);
+
+            using (var storage = new InMemoryVectorStorage(dims))
+            using (var index = new VectorIndex(storage))
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    float[] vec = new float[dims];
+                    for (int d = 0; d < dims; d++)
+                        vec[d] = (float)rng.NextDouble();
+                    index.Add(vec, $"Doc_{i}");
+                }
+
+                float[] query = new float[dims];
+                for (int d = 0; d < dims; d++) query[d] = (float)rng.NextDouble();
+
+                var seqResults = index.Search(query, topK: 5, maxDegreeOfParallelism: 1);
+                var parResults = index.Search(query, topK: 5, maxDegreeOfParallelism: 4);
+
+                Assert.Equal(seqResults.Length, parResults.Length);
+                for (int i = 0; i < seqResults.Length; i++)
+                {
+                    Assert.Equal(seqResults[i].Id, parResults[i].Id);
+                    Assert.True(Math.Abs(seqResults[i].Score - parResults[i].Score) < 1e-5f);
+                }
+            }
+        }
     }
 }

@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Glacier.Vector.Compute;
+using Glacier.Vector.Core;
 using Glacier.Vector.Storage;
 
 namespace Glacier.Vector.Index
@@ -70,9 +71,9 @@ namespace Glacier.Vector.Index
 
         /// <summary>
         /// Performs a brute-force (Flat) Exact Nearest Neighbor search using 
-        /// AVX2/AVX-512 SIMD instructions and thread-isolated chunking.
+        /// AVX2/AVX-512 SIMD instructions and dynamic thread-isolated chunking.
         /// </summary>
-        public SearchResult[] Search(ReadOnlySpan<float> query, int topK = 5)
+        public unsafe SearchResult[] Search(ReadOnlySpan<float> query, int topK = 5, int maxDegreeOfParallelism = 0)
         {
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
@@ -80,45 +81,55 @@ namespace Glacier.Vector.Index
             int totalCount = _storage.Count;
             if (totalCount == 0 || topK <= 0) return Array.Empty<SearchResult>();
 
-            // For small datasets, avoid the ThreadPool overhead entirely
-            int numThreads = Math.Min(totalCount / 10_000, Environment.ProcessorCount);
-            if (numThreads <= 1)
+            int parallelism = VectorConcurrency.GetEffectiveParallelism(maxDegreeOfParallelism);
+            long totalOps = (long)totalCount * Dimensions;
+
+            // For small datasets or single-thread configuration, run sequentially with zero thread overhead
+            if (parallelism <= 1 || totalOps < 32_768)
             {
-                return SearchChunk(query.ToArray(), 0, totalCount, topK);
+                return SearchChunk(query, 0, totalCount, topK);
             }
 
-            int chunkSize = (totalCount + numThreads - 1) / numThreads;
-            Task<SearchResult[]>[] tasks = new Task<SearchResult[]>[numThreads];
+            int numChunks = Math.Min(parallelism, Math.Max(1, (totalCount + 255) / 256));
+            int chunkSize = (totalCount + numChunks - 1) / numChunks;
+            var chunkResults = new SearchResult[numChunks][];
 
-            // We must copy the query to an array because ref structs (ReadOnlySpan) 
-            // cannot be captured inside lambda expressions for Task.Run
-            float[] queryArray = query.ToArray();
-
-            for (int t = 0; t < numThreads; t++)
+            fixed (float* pQuery = query)
             {
-                int start = t * chunkSize;
-                int end = Math.Min(start + chunkSize, totalCount);
+                IntPtr queryPtr = (IntPtr)pQuery;
+                int dims = Dimensions;
 
-                if (start >= end)
+                var parallelOptions = new System.Threading.Tasks.ParallelOptions
                 {
-                    tasks[t] = Task.FromResult(Array.Empty<SearchResult>());
-                    continue;
-                }
+                    MaxDegreeOfParallelism = parallelism
+                };
 
-                // Fire off isolated worker tasks (Parallel Block pattern)
-                tasks[t] = Task.Run(() => SearchChunk(queryArray, start, end, topK));
+                System.Threading.Tasks.Parallel.For(0, numChunks, parallelOptions, t =>
+                {
+                    int start = t * chunkSize;
+                    int end = Math.Min(start + chunkSize, totalCount);
+
+                    if (start >= end)
+                    {
+                        chunkResults[t] = Array.Empty<SearchResult>();
+                        return;
+                    }
+
+                    ReadOnlySpan<float> localQuery = new ReadOnlySpan<float>((float*)queryPtr, dims);
+                    chunkResults[t] = SearchChunk(localQuery, start, end, topK);
+                });
             }
 
-            Task.WaitAll(tasks);
+            // Final Merge Phase: Combine the Top-K from all chunks
+            var globalQueue = new PriorityQueue<SearchResult, float>(topK + 1);
 
-            // Final Merge Phase: Combine the Top-K from all threads
-            var globalQueue = new PriorityQueue<SearchResult, float>();
-
-            for (int t = 0; t < numThreads; t++)
+            for (int t = 0; t < numChunks; t++)
             {
-                var localResults = tasks[t].Result;
-                foreach (var res in localResults)
+                var localResults = chunkResults[t];
+                if (localResults == null) continue;
+                for (int j = 0; j < localResults.Length; j++)
                 {
+                    var res = localResults[j];
                     globalQueue.Enqueue(res, res.Score);
                     if (globalQueue.Count > topK)
                     {
@@ -138,7 +149,7 @@ namespace Glacier.Vector.Index
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private SearchResult[] SearchChunk(float[] query, int start, int end, int topK)
+        private SearchResult[] SearchChunk(ReadOnlySpan<float> querySpan, int start, int end, int topK)
         {
             // .NET 6+ PriorityQueue is a Min-Heap. By prioritizing by Score, 
             // the SMALLEST score stays at the top of the queue, making it perfectly
@@ -146,7 +157,6 @@ namespace Glacier.Vector.Index
             var localQueue = new PriorityQueue<int, float>(topK + 1);
 
             float localMinScore = float.MinValue;
-            ReadOnlySpan<float> querySpan = query;
 
             for (int i = start; i < end; i++)
             {
@@ -175,9 +185,6 @@ namespace Glacier.Vector.Index
 
             while (localQueue.TryDequeue(out int id, out float score))
             {
-                // Note: In a true massive-scale deployment, you might delay 
-                // fetching the string metadata until the absolute final global merge
-                // to save L3 cache space.
                 string meta = string.Empty;
                 lock (_writeLock) // Safe read
                 {

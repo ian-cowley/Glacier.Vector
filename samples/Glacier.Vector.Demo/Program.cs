@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
@@ -97,8 +97,11 @@ namespace Glacier.Vector.Demo
                 Console.WriteLine($"  Rank {i + 1} | Score: {results[i].Score:F4} | ID: {results[i].Id} | Meta: {results[i].Metadata}");
             }
 
-            Console.WriteLine("\nPress any key to exit...");
-            Console.ReadLine();
+            if (!Console.IsInputRedirected)
+            {
+                Console.WriteLine("\nPress any key to exit...");
+                try { Console.ReadKey(); } catch { }
+            }
         }
     }
 }
