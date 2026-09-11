@@ -36,7 +36,9 @@ jobs:
         run: dotnet restore
 
       - name: Build
-        run: dotnet build src/Glacier.Vector/Glacier.Vector.csproj tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj --configuration Release --no-restore
+        run: |
+          dotnet build src/Glacier.Vector/Glacier.Vector.csproj --configuration Release --no-restore
+          dotnet build tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj --configuration Release --no-restore
 
       - name: Run tests
         run: dotnet test tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj --configuration Release --no-restore --no-build
