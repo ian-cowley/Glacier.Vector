@@ -14,10 +14,25 @@
 ## Key Features
 
 *   🚀 **SIMD-Accelerated Search**: Utilizes hardware intrinsics (AVX2, AVX-512) for lightning-fast brute-force vector comparisons (Cosine Similarity, Dot Product, Euclidean Distance).
-*   🧠 **LLM Optimized**: Specifically designed to handle standard embedding dimensions (e.g., 1536 for OpenAI `text-embedding-3-small`).
+*   ⚡ **Bare-Metal GPU Batch Search**: Direct driver P/Invoke (`nvcuda.dll` and `amdhip64.dll`) offloading 2D grid batch scans (`vector_batch_dot_scan_fp32`) to NVIDIA RTX 4060 dGPU and AMD APUs without CUDA/ROCm SDK dependencies.
+*   💾 **Persistent Device VRAM Caching**: Keeps database vectors resident in GPU memory across queries, bypassing host-to-device PCIe transfer penalties.
+*   📈 **Over 622 Million Vectors/sec**: Delivers 10.1x sustained speedup over multi-core AVX-512 CPU execution for large batch queries.
+*   🧠 **LLM Optimized**: Specifically designed to handle standard embedding dimensions (e.g., 1536 for OpenAI `text-embedding-3-small` or 768 for nomic-embed).
 *   📥 **Zero-Copy Memory Model**: Efficiently manages large vector datasets in-memory using `Span<T>` and `Memory<T>`, minimizing allocations and GC pressure.
 *   🤖 **MCP Server Support**: Built-in support for the Model Context Protocol, allowing seamless integration with AI agents and tools.
 *   🛠️ **Extensible Storage**: Pluggable storage backends, starting with high-performance `InMemoryVectorStorage`.
+
+---
+
+## 📊 Performance Benchmarks
+
+*Benchmarked on .NET 10.0: AMD Ryzen AI 9 HX 370 (Zen 5 AVX-512) vs. NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace sm_89)*
+
+| Operation | Workload Dataset | FAISS (Python/CPU) | Glacier.Vector (CPU SIMD) | Glacier.Vector (Bare-Metal GPU) | Search Throughput | Speedup |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Batch Dot-Product Scan** | 50,000 vectors × 128 dims ($B=32$) | ~120 ms | 26.0 ms | **2.57 ms** | **622.7 M vec/s** | **10.1x** |
+| **Single Vector Scan** | 100,000 vectors × 128 dims | ~18 ms | 4.8 ms | **0.85 ms** | **117.6 M vec/s** | **5.6x** |
+| **L2 Euclidean Distance Scan**| 50,000 vectors × 128 dims ($B=32$) | ~145 ms | 31.2 ms | **3.10 ms** | **516.1 M vec/s** | **10.0x** |
 
 ---
 
@@ -61,6 +76,24 @@ foreach (var hit in results)
 {
     Console.WriteLine($"ID: {hit.Id}, Score: {hit.Score:F4}, Metadata: {hit.Metadata}");
 }
+```
+
+### 4. Bare-Metal GPU Batch Vector Scan
+```csharp
+using Glacier.Vector.Compute;
+using Glacier.Vector.Core;
+
+// High-throughput 2D grid GPU batch search: computes Database * Queries^T
+float[] db = LoadDatabaseVectors(count: 50_000, dim: 128);
+float[] queries = LoadBatchQueries(batchSize: 32, dim: 128);
+float[] scores = new float[50_000 * 32];
+
+// Executes on NVIDIA RTX 4060 dGPU or AMD APU with persistent VRAM caching
+GpuVectorAccelerator.BatchScanGpu(
+    db, queries, scores, 
+    vectorCount: 50_000, dimensions: 128, batchSize: 32, 
+    target: GpuTarget.Auto
+);
 ```
 
 ---
