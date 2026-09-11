@@ -70,10 +70,158 @@ namespace Glacier.Vector.Index
         }
 
         /// <summary>
-        /// Performs a brute-force (Flat) Exact Nearest Neighbor search using 
-        /// AVX2/AVX-512 SIMD instructions and dynamic thread-isolated chunking.
+        /// Performs nearest neighbor search on the specified hardware target (Auto, Nvidia, Amd, or Cpu).
         /// </summary>
-        public unsafe SearchResult[] Search(ReadOnlySpan<float> query, int topK = 5, int maxDegreeOfParallelism = 0)
+        public unsafe SearchResult[] Search(
+            ReadOnlySpan<float> query, 
+            int topK = 5, 
+            GpuTarget target = GpuTarget.Auto, 
+            int maxDegreeOfParallelism = 0)
+        {
+            if (query.Length != Dimensions)
+                throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
+
+            int totalCount = _storage.Count;
+            if (totalCount == 0 || topK <= 0) return Array.Empty<SearchResult>();
+
+            if (target != GpuTarget.Cpu && GpuVectorAccelerator.IsGpuAvailable && totalCount >= 5_000)
+            {
+                var gpuRes = TryGpuSearch(query, topK, target);
+                if (gpuRes != null) return gpuRes;
+            }
+
+            return SearchCpu(query, topK, maxDegreeOfParallelism);
+        }
+
+        private unsafe SearchResult[]? TryGpuSearch(ReadOnlySpan<float> query, int topK, GpuTarget target)
+        {
+            int totalCount = _storage.Count;
+            int dims = Dimensions;
+            int chunkCount = _storage.ChunkCount;
+
+            var globalQueue = new PriorityQueue<SearchResult, float>(topK + 1);
+
+            int baseVectorIndex = 0;
+            for (int c = 0; c < chunkCount; c++)
+            {
+                ReadOnlySpan<float> chunkSpan = _storage.GetChunkSpan(c);
+                int chunkVectors = _storage.GetChunkVectorCount(c);
+                if (chunkSpan.IsEmpty || chunkVectors == 0) return null;
+
+                float[] scores = GC.AllocateArray<float>(chunkVectors, pinned: true);
+
+                if (!GpuVectorAccelerator.ScanChunkGpu(query, chunkSpan, scores, chunkVectors, dims, isL2Distance: false, target))
+                {
+                    return null;
+                }
+
+                for (int i = 0; i < chunkVectors; i++)
+                {
+                    float score = scores[i];
+                    int globalId = baseVectorIndex + i;
+
+                    if (globalQueue.Count < topK || score > globalQueue.Peek().Score)
+                    {
+                        string meta = string.Empty;
+                        lock (_writeLock)
+                        {
+                            if (globalId < _metadata.Count) meta = _metadata[globalId];
+                        }
+
+                        globalQueue.Enqueue(new SearchResult(globalId, score, meta), score);
+                        if (globalQueue.Count > topK)
+                        {
+                            globalQueue.Dequeue();
+                        }
+                    }
+                }
+
+                baseVectorIndex += chunkVectors;
+            }
+
+            var results = new SearchResult[globalQueue.Count];
+            for (int i = results.Length - 1; i >= 0; i--)
+            {
+                results[i] = globalQueue.Dequeue();
+            }
+            return results;
+        }
+
+        /// <summary>
+        /// High-throughput batch vector search: searches multiple query vectors in parallel.
+        /// Accelerated on GPU via matrix multiplication (Database * Queries^T).
+        /// </summary>
+        public unsafe SearchResult[][] BatchSearch(
+            ReadOnlySpan<float> queries,
+            int batchSize,
+            int topK = 5,
+            GpuTarget target = GpuTarget.Auto)
+        {
+            if (queries.Length < batchSize * Dimensions)
+                throw new ArgumentException("Queries span length does not match batchSize * Dimensions.");
+
+            int totalCount = _storage.Count;
+            if (totalCount == 0 || topK <= 0 || batchSize <= 0)
+                return Array.Empty<SearchResult[]>();
+
+            var batchResults = new SearchResult[batchSize][];
+
+            if (target != GpuTarget.Cpu && GpuVectorAccelerator.IsGpuAvailable && _storage.ChunkCount == 1 && totalCount >= 1024)
+            {
+                ReadOnlySpan<float> dbSpan = _storage.GetChunkSpan(0);
+                if (!dbSpan.IsEmpty)
+                {
+                    float[] scoreMatrix = GC.AllocateArray<float>(totalCount * batchSize, pinned: true);
+
+                    if (GpuVectorAccelerator.BatchScanGpu(dbSpan, queries, scoreMatrix, totalCount, Dimensions, batchSize, target))
+                    {
+                        Parallel.For(0, batchSize, b =>
+                        {
+                            var queue = new PriorityQueue<SearchResult, float>(topK + 1);
+                            for (int i = 0; i < totalCount; i++)
+                            {
+                                float score = scoreMatrix[i * batchSize + b];
+                                if (queue.Count < topK || score > queue.Peek().Score)
+                                {
+                                    string meta = string.Empty;
+                                    lock (_writeLock)
+                                    {
+                                        if (i < _metadata.Count) meta = _metadata[i];
+                                    }
+                                    queue.Enqueue(new SearchResult(i, score, meta), score);
+                                    if (queue.Count > topK) queue.Dequeue();
+                                }
+                            }
+
+                            var res = new SearchResult[queue.Count];
+                            for (int i = res.Length - 1; i >= 0; i--)
+                            {
+                                res[i] = queue.Dequeue();
+                            }
+                            batchResults[b] = res;
+                        });
+
+                        return batchResults;
+                    }
+                }
+            }
+
+            // Fallback: search each query sequentially / parallel on CPU
+            fixed (float* pQueries = queries)
+            {
+                IntPtr queriesPtr = (IntPtr)pQueries;
+                int dims = Dimensions;
+                Parallel.For(0, batchSize, b =>
+                {
+                    ReadOnlySpan<float> q = new ReadOnlySpan<float>((float*)queriesPtr + (b * dims), dims);
+                    batchResults[b] = Search(q, topK, GpuTarget.Cpu, maxDegreeOfParallelism: 1);
+                });
+            }
+
+            return batchResults;
+        }
+
+        private unsafe SearchResult[] SearchCpu(ReadOnlySpan<float> query, int topK, int maxDegreeOfParallelism)
         {
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");

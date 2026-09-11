@@ -26,6 +26,21 @@ namespace Glacier.Vector.Storage
         /// Appends a new vector to the storage.
         /// </summary>
         void Append(ReadOnlySpan<float> vector);
+
+        /// <summary>
+        /// Total number of contiguous memory chunks in storage.
+        /// </summary>
+        int ChunkCount => 1;
+
+        /// <summary>
+        /// Retrieves the contiguous memory span of a chunk for GPU / SIMD block operations.
+        /// </summary>
+        ReadOnlySpan<float> GetChunkSpan(int chunkIndex) => ReadOnlySpan<float>.Empty;
+
+        /// <summary>
+        /// Number of valid vectors in the specified chunk.
+        /// </summary>
+        int GetChunkVectorCount(int chunkIndex) => Count;
     }
 
     /// <summary>
@@ -41,6 +56,22 @@ namespace Glacier.Vector.Storage
         private readonly List<float[]> _chunks;
         private int _currentChunkIndex;
         private int _currentChunkVectorCount;
+
+        public int ChunkCount => _chunks.Count;
+
+        public ReadOnlySpan<float> GetChunkSpan(int chunkIndex)
+        {
+            if ((uint)chunkIndex >= (uint)_chunks.Count) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            int count = GetChunkVectorCount(chunkIndex);
+            return new ReadOnlySpan<float>(_chunks[chunkIndex], 0, count * Dimensions);
+        }
+
+        public int GetChunkVectorCount(int chunkIndex)
+        {
+            if ((uint)chunkIndex >= (uint)_chunks.Count) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            if (chunkIndex == _currentChunkIndex) return _currentChunkVectorCount;
+            return _vectorsPerChunk;
+        }
 
         // Default to ~65k vectors per chunk. 
         // For 1536 dims, this is exactly 402 MB per chunk.
@@ -102,9 +133,9 @@ namespace Glacier.Vector.Storage
         public int Count { get; private set; }
 
         private readonly string _filePath;
-        private FileStream _fileStream;
-        private MemoryMappedFile _mmf;
-        private MemoryMappedViewAccessor _accessor;
+        private FileStream _fileStream = null!;
+        private MemoryMappedFile _mmf = null!;
+        private MemoryMappedViewAccessor _accessor = null!;
         private byte* _basePointer;
 
         // Start with a 1GB file, grow in 1GB chunks to avoid constant file resizing
@@ -146,6 +177,17 @@ namespace Glacier.Vector.Storage
             // Acquire raw unmanaged pointer to the mapped memory
             _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _basePointer);
         }
+
+        public int ChunkCount => 1;
+
+        public ReadOnlySpan<float> GetChunkSpan(int chunkIndex)
+        {
+            if (chunkIndex != 0) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            if (_basePointer == null || Count == 0) return ReadOnlySpan<float>.Empty;
+            return new ReadOnlySpan<float>((float*)_basePointer, Count * Dimensions);
+        }
+
+        public int GetChunkVectorCount(int chunkIndex) => Count;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<float> GetVector(int index)
