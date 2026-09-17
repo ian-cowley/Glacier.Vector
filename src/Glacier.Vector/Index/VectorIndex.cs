@@ -77,6 +77,24 @@ namespace Glacier.Vector.Index
         }
 
         /// <summary>
+        /// Performs nearest neighbor search on the CPU/GPU with default options.
+        /// Preserved for binary backward compatibility with assemblies compiled against prior versions.
+        /// </summary>
+        public unsafe SearchResult[] Search(ReadOnlySpan<float> query, int topK)
+        {
+            return Search(query, topK, GpuTarget.Auto, 0);
+        }
+
+        /// <summary>
+        /// Performs nearest neighbor search on the CPU/GPU with default topK and options.
+        /// Preserved for binary backward compatibility with assemblies compiled against prior versions.
+        /// </summary>
+        public unsafe SearchResult[] Search(ReadOnlySpan<float> query)
+        {
+            return Search(query, 5, GpuTarget.Auto, 0);
+        }
+
+        /// <summary>
         /// Performs nearest neighbor search on the specified hardware target (Auto, Nvidia, Amd, or Cpu).
         /// </summary>
         public unsafe SearchResult[] Search(
