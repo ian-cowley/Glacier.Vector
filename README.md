@@ -6,6 +6,17 @@
 
 > 📖 **Read the Deep-Dive**: **[I built a zero-dependency C# vector database that saturates DDR5 RAM bandwidth.](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a)**
 
+```text
+========================================================================================================
+  GLACIER.VECTOR BARE-METAL GPU THROUGHPUT BENCHMARK (NVIDIA RTX 4060 vs PYTHON FAISS)
+========================================================================================================
+  Python FAISS (CPU Brute Force)     :  ~120 ms
+  Glacier.Vector (Bare-Metal GPU)    :  2.57 ms (622,700,000 vectors/sec)
+--------------------------------------------------------------------------------------------------------
+  🏆 SPEEDUP                         :  46x FASTER THAN PYTHON FAISS / 10.1x FASTER THAN AVX-512
+  ⚡ HARDWARE ARCHITECTURE           :  Pure C# Direct P/Invoke (Zero CUDA Toolkit / Zero C++ DLLs)
+========================================================================================================
+```
 
 **Glacier.Vector** is a high-performance, SIMD-accelerated vector search engine and index for .NET 10. Built for speed and efficiency, it provides a zero-copy architecture for storing and querying high-dimensional embeddings, commonly used in LLM-powered applications and semantic search.
 

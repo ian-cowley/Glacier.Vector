@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Vector.Compute;
 using Glacier.Vector.Core;
@@ -42,7 +44,7 @@ namespace Glacier.Vector.Index
         // Parallel list to hold metadata. Since vector IDs are sequential (0 to N-1),
         // a simple List<string> is significantly faster and uses less memory than a Dictionary.
         private readonly List<string> _metadata;
-        private readonly object _writeLock = new object();
+        private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.NoRecursion);
 
         public int Dimensions => _storage.Dimensions;
         public int Count => _storage.Count;
@@ -62,10 +64,15 @@ namespace Glacier.Vector.Index
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            lock (_writeLock)
+            _rwLock.EnterWriteLock();
+            try
             {
                 _storage.Append(vector);
                 _metadata.Add(metadata);
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
             }
         }
 
@@ -99,7 +106,7 @@ namespace Glacier.Vector.Index
             int dims = Dimensions;
             int chunkCount = _storage.ChunkCount;
 
-            var globalQueue = new PriorityQueue<SearchResult, float>(topK + 1);
+            var globalQueue = new PriorityQueue<int, float>(topK + 1);
 
             int baseVectorIndex = 0;
             for (int c = 0; c < chunkCount; c++)
@@ -108,41 +115,55 @@ namespace Glacier.Vector.Index
                 int chunkVectors = _storage.GetChunkVectorCount(c);
                 if (chunkSpan.IsEmpty || chunkVectors == 0) return null;
 
-                float[] scores = GC.AllocateArray<float>(chunkVectors, pinned: true);
-
-                if (!GpuVectorAccelerator.ScanChunkGpu(query, chunkSpan, scores, chunkVectors, dims, isL2Distance: false, target))
+                float[] pooledScores = ArrayPool<float>.Shared.Rent(chunkVectors);
+                try
                 {
-                    return null;
-                }
-
-                for (int i = 0; i < chunkVectors; i++)
-                {
-                    float score = scores[i];
-                    int globalId = baseVectorIndex + i;
-
-                    if (globalQueue.Count < topK || score > globalQueue.Peek().Score)
+                    Span<float> scores = pooledScores.AsSpan(0, chunkVectors);
+                    if (!GpuVectorAccelerator.ScanChunkGpu(query, chunkSpan, scores, chunkVectors, dims, isL2Distance: false, target))
                     {
-                        string meta = string.Empty;
-                        lock (_writeLock)
-                        {
-                            if (globalId < _metadata.Count) meta = _metadata[globalId];
-                        }
+                        return null;
+                    }
 
-                        globalQueue.Enqueue(new SearchResult(globalId, score, meta), score);
-                        if (globalQueue.Count > topK)
+                    float minQueueScore = float.MinValue;
+                    for (int i = 0; i < chunkVectors; i++)
+                    {
+                        float score = scores[i];
+                        int globalId = baseVectorIndex + i;
+
+                        if (globalQueue.Count < topK || score > minQueueScore)
                         {
-                            globalQueue.Dequeue();
+                            globalQueue.Enqueue(globalId, score);
+                            if (globalQueue.Count > topK)
+                            {
+                                globalQueue.Dequeue();
+                                globalQueue.TryPeek(out _, out minQueueScore);
+                            }
                         }
                     }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(pooledScores);
                 }
 
                 baseVectorIndex += chunkVectors;
             }
 
             var results = new SearchResult[globalQueue.Count];
-            for (int i = results.Length - 1; i >= 0; i--)
+            _rwLock.EnterReadLock();
+            try
             {
-                results[i] = globalQueue.Dequeue();
+                int metaCount = _metadata.Count;
+                for (int i = results.Length - 1; i >= 0; i--)
+                {
+                    globalQueue.TryDequeue(out int id, out float score);
+                    string meta = (id < metaCount) ? _metadata[id] : string.Empty;
+                    results[i] = new SearchResult(id, score, meta);
+                }
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
             }
             return results;
         }
@@ -171,37 +192,65 @@ namespace Glacier.Vector.Index
                 ReadOnlySpan<float> dbSpan = _storage.GetChunkSpan(0);
                 if (!dbSpan.IsEmpty)
                 {
-                    float[] scoreMatrix = GC.AllocateArray<float>(totalCount * batchSize, pinned: true);
+                    int matrixLen = totalCount * batchSize;
+                    float[] pooledScoreMatrix = ArrayPool<float>.Shared.Rent(matrixLen);
 
-                    if (GpuVectorAccelerator.BatchScanGpu(dbSpan, queries, scoreMatrix, totalCount, Dimensions, batchSize, target))
+                    try
                     {
-                        Parallel.For(0, batchSize, b =>
+                        Span<float> scoreMatrix = pooledScoreMatrix.AsSpan(0, matrixLen);
+
+                        if (GpuVectorAccelerator.BatchScanGpu(dbSpan, queries, scoreMatrix, totalCount, Dimensions, batchSize, target))
                         {
-                            var queue = new PriorityQueue<SearchResult, float>(topK + 1);
-                            for (int i = 0; i < totalCount; i++)
+                            _rwLock.EnterReadLock();
+                            int metaCount = _metadata.Count;
+                            _rwLock.ExitReadLock();
+
+                            Parallel.For(0, batchSize, b =>
                             {
-                                float score = scoreMatrix[i * batchSize + b];
-                                if (queue.Count < topK || score > queue.Peek().Score)
+                                var queue = new PriorityQueue<int, float>(topK + 1);
+                                float minScore = float.MinValue;
+                                for (int i = 0; i < totalCount; i++)
                                 {
-                                    string meta = string.Empty;
-                                    lock (_writeLock)
+                                    float score = pooledScoreMatrix[i * batchSize + b];
+                                    if (queue.Count < topK || score > minScore)
                                     {
-                                        if (i < _metadata.Count) meta = _metadata[i];
+                                        queue.Enqueue(i, score);
+                                        if (queue.Count > topK)
+                                        {
+                                            queue.Dequeue();
+                                            queue.TryPeek(out _, out minScore);
+                                        }
                                     }
-                                    queue.Enqueue(new SearchResult(i, score, meta), score);
-                                    if (queue.Count > topK) queue.Dequeue();
                                 }
-                            }
 
-                            var res = new SearchResult[queue.Count];
-                            for (int i = res.Length - 1; i >= 0; i--)
-                            {
-                                res[i] = queue.Dequeue();
-                            }
-                            batchResults[b] = res;
-                        });
+                                var res = new SearchResult[queue.Count];
+                                for (int i = res.Length - 1; i >= 0; i--)
+                                {
+                                    queue.TryDequeue(out int id, out float score);
+                                    string meta = string.Empty;
+                                    if (id < metaCount)
+                                    {
+                                        _rwLock.EnterReadLock();
+                                        try
+                                        {
+                                            if (id < _metadata.Count) meta = _metadata[id];
+                                        }
+                                        finally
+                                        {
+                                            _rwLock.ExitReadLock();
+                                        }
+                                    }
+                                    res[i] = new SearchResult(id, score, meta);
+                                }
+                                batchResults[b] = res;
+                            });
 
-                        return batchResults;
+                            return batchResults;
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(pooledScoreMatrix);
                     }
                 }
             }
@@ -331,15 +380,19 @@ namespace Glacier.Vector.Index
             var results = new SearchResult[localQueue.Count];
             int idx = results.Length - 1;
 
-            while (localQueue.TryDequeue(out int id, out float score))
+            _rwLock.EnterReadLock();
+            try
             {
-                string meta = string.Empty;
-                lock (_writeLock) // Safe read
+                int metaCount = _metadata.Count;
+                while (localQueue.TryDequeue(out int id, out float score))
                 {
-                    if (id < _metadata.Count) meta = _metadata[id];
+                    string meta = (id < metaCount) ? _metadata[id] : string.Empty;
+                    results[idx--] = new SearchResult(id, score, meta);
                 }
-
-                results[idx--] = new SearchResult(id, score, meta);
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
             }
 
             return results;
@@ -348,6 +401,7 @@ namespace Glacier.Vector.Index
         public void Dispose()
         {
             _storage?.Dispose();
+            _rwLock?.Dispose();
         }
     }
 }

@@ -24,6 +24,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Gpu" Version="1.0.2" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.6" />
   </ItemGroup>
 </Project>
