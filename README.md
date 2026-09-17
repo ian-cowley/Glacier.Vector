@@ -1,3 +1,5 @@
+![Glacier.Vector Banner](assets/banner.jpg)
+
 # Glacier.Vector
 
 [![DEV.to Story](https://img.shields.io/badge/DEV.to-Story-0a0a0a?style=for-the-badge&logo=devto&logoColor=white)](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a)
