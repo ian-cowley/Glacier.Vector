@@ -2,10 +2,10 @@ name: .NET build, test, and publish
 
 on:
   push:
-    branches: [master, main]
+    branches: [main, master]
     tags: ['v*']
   workflow_dispatch:
-  
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,19 +26,32 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-          
+
       - name: Setup NuGet sources
         run: |
           mkdir -p ../nuget-local
           dotnet nuget add source --name "github-packages" --username "${{ github.repository_owner }}" --password "${{ secrets.GITHUB_TOKEN }}" --store-password-in-clear-text "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" || true
 
+      - name: Wait for upstream NuGet packages to be available
+        run: |
+          wait_for_nuget() {
+            local pkg=$1 ver=$2 timeout=1200 elapsed=0
+            echo "Waiting for $pkg $ver on nuget.org..."
+            until curl -sf "https://api.nuget.org/v3-flatcontainer/${pkg,,}/${ver}/${pkg,,}.${ver}.nupkg" -o /dev/null; do
+              if [ $elapsed -ge $timeout ]; then echo "TIMEOUT waiting for $pkg $ver" && exit 1; fi
+              echo "  $pkg $ver not yet available, retrying in 30s (${elapsed}s elapsed)..."
+              sleep 30; elapsed=$((elapsed+30))
+            done
+            echo "  $pkg $ver is available."
+          }
+          wait_for_nuget Glacier.Gpu 1.0.7
+          wait_for_nuget Glacier.Tensor 1.0.7
+
       - name: Restore dependencies
         run: dotnet restore
 
       - name: Build
-        run: |
-          dotnet build src/Glacier.Vector/Glacier.Vector.csproj --configuration Release --no-restore
-          dotnet build tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj --configuration Release --no-restore
+        run: dotnet build --configuration Release --no-restore
 
       - name: Run tests
         run: dotnet test tests/Glacier.Vector.Tests/Glacier.Vector.Tests.csproj --configuration Release --no-restore --no-build
@@ -47,12 +60,12 @@ jobs:
         run: dotnet pack src/Glacier.Vector/Glacier.Vector.csproj --configuration Release --output packages
 
       - name: Publish to nuget.org
-        if: env.NUGET_API_KEY != '' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+        if: env.NUGET_API_KEY != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
+        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate || true
 
       - name: Publish to GitHub Packages
-        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
