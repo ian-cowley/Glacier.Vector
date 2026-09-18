@@ -4,7 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- NuGet Packaging Properties -->
-    <Version>1.0.5</Version>
+    <Version>1.0.7</Version>
     <PackageId>Glacier.Vector</PackageId>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier</Company>
@@ -24,6 +24,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Gpu" Version="1.0.6" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.7" />
   </ItemGroup>
 </Project>

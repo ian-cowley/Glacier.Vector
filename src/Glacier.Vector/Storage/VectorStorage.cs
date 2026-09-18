@@ -53,23 +53,26 @@ namespace Glacier.Vector.Storage
         public int Count { get; private set; }
 
         private readonly int _vectorsPerChunk;
-        private readonly List<float[]> _chunks;
+        private float[]?[] _chunks;
         private int _currentChunkIndex;
         private int _currentChunkVectorCount;
+        private readonly object _appendLock = new();
 
-        public int ChunkCount => _chunks.Count;
+        public int ChunkCount => Volatile.Read(ref _currentChunkIndex) + 1;
 
         public ReadOnlySpan<float> GetChunkSpan(int chunkIndex)
         {
-            if ((uint)chunkIndex >= (uint)_chunks.Count) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            if ((uint)chunkIndex >= (uint)ChunkCount) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            float[]? chunk = Volatile.Read(ref _chunks[chunkIndex]);
+            if (chunk == null) return ReadOnlySpan<float>.Empty;
             int count = GetChunkVectorCount(chunkIndex);
-            return new ReadOnlySpan<float>(_chunks[chunkIndex], 0, count * Dimensions);
+            return new ReadOnlySpan<float>(chunk, 0, count * Dimensions);
         }
 
         public int GetChunkVectorCount(int chunkIndex)
         {
-            if ((uint)chunkIndex >= (uint)_chunks.Count) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
-            if (chunkIndex == _currentChunkIndex) return _currentChunkVectorCount;
+            if ((uint)chunkIndex >= (uint)ChunkCount) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            if (chunkIndex == Volatile.Read(ref _currentChunkIndex)) return Volatile.Read(ref _currentChunkVectorCount);
             return _vectorsPerChunk;
         }
 
@@ -79,7 +82,8 @@ namespace Glacier.Vector.Storage
         {
             Dimensions = dimensions;
             _vectorsPerChunk = vectorsPerChunk;
-            _chunks = new List<float[]> { new float[vectorsPerChunk * dimensions] };
+            _chunks = new float[1024][];
+            _chunks[0] = new float[vectorsPerChunk * dimensions];
             _currentChunkIndex = 0;
             _currentChunkVectorCount = 0;
             Count = 0;
@@ -91,8 +95,9 @@ namespace Glacier.Vector.Storage
             // Fast math to find which array holds our vector, and where it starts
             int chunkIdx = index / _vectorsPerChunk;
             int offsetInChunk = (index % _vectorsPerChunk) * Dimensions;
+            float[] chunk = Volatile.Read(ref _chunks[chunkIdx])!;
 
-            return new ReadOnlySpan<float>(_chunks[chunkIdx], offsetInChunk, Dimensions);
+            return new ReadOnlySpan<float>(chunk, offsetInChunk, Dimensions);
         }
 
         public void Append(ReadOnlySpan<float> vector)
@@ -100,26 +105,41 @@ namespace Glacier.Vector.Storage
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            // If the current chunk is full, allocate a new one
-            if (_currentChunkVectorCount == _vectorsPerChunk)
+            lock (_appendLock)
             {
-                _chunks.Add(new float[_vectorsPerChunk * Dimensions]);
-                _currentChunkIndex++;
-                _currentChunkVectorCount = 0;
+                // If the current chunk is full, allocate a new one
+                if (_currentChunkVectorCount == _vectorsPerChunk)
+                {
+                    int nextIndex = _currentChunkIndex + 1;
+                    if (nextIndex >= _chunks.Length)
+                    {
+                        var newChunks = new float[_chunks.Length * 2][];
+                        Array.Copy(_chunks, newChunks, _chunks.Length);
+                        _chunks = newChunks;
+                    }
+
+                    Volatile.Write(ref _chunks[nextIndex], new float[_vectorsPerChunk * Dimensions]);
+                    Volatile.Write(ref _currentChunkIndex, nextIndex);
+                    Volatile.Write(ref _currentChunkVectorCount, 0);
+                }
+
+                // Copy the data directly into the pre-allocated chunk
+                int offset = _currentChunkVectorCount * Dimensions;
+                float[] chunk = _chunks[_currentChunkIndex]!;
+                vector.CopyTo(new Span<float>(chunk, offset, Dimensions));
+
+                _currentChunkVectorCount++;
+                Count++;
             }
-
-            // Copy the data directly into the pre-allocated chunk
-            int offset = _currentChunkVectorCount * Dimensions;
-            vector.CopyTo(new Span<float>(_chunks[_currentChunkIndex], offset, Dimensions));
-
-            _currentChunkVectorCount++;
-            Count++;
         }
 
         public void Dispose()
         {
-            _chunks.Clear();
-            Count = 0;
+            lock (_appendLock)
+            {
+                Array.Clear(_chunks, 0, _chunks.Length);
+                Count = 0;
+            }
         }
     }
 
@@ -136,11 +156,14 @@ namespace Glacier.Vector.Storage
         private FileStream _fileStream = null!;
         private MemoryMappedFile _mmf = null!;
         private MemoryMappedViewAccessor _accessor = null!;
-        private byte* _basePointer;
+        private IntPtr _basePointer;
 
         // Start with a 1GB file, grow in 1GB chunks to avoid constant file resizing
         private const long GrowSize = 1024 * 1024 * 1024;
         private long _currentCapacityBytes;
+        private readonly List<MemoryMappedFile> _oldMmfs = new();
+        private readonly List<MemoryMappedViewAccessor> _oldAccessors = new();
+        private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.NoRecursion);
 
         public MmfVectorStorage(string filePath, int dimensions)
         {
@@ -174,8 +197,10 @@ namespace Glacier.Vector.Storage
             _mmf = MemoryMappedFile.CreateFromFile(_fileStream, null, _currentCapacityBytes, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, false);
             _accessor = _mmf.CreateViewAccessor(0, _currentCapacityBytes, MemoryMappedFileAccess.ReadWrite);
 
-            // Acquire raw unmanaged pointer to the mapped memory
-            _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _basePointer);
+            // Acquire raw unmanaged pointer to local variable first, then atomically publish
+            byte* newPtr = null;
+            _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref newPtr);
+            Volatile.Write(ref _basePointer, (IntPtr)newPtr);
         }
 
         public int ChunkCount => 1;
@@ -183,8 +208,9 @@ namespace Glacier.Vector.Storage
         public ReadOnlySpan<float> GetChunkSpan(int chunkIndex)
         {
             if (chunkIndex != 0) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
-            if (_basePointer == null || Count == 0) return ReadOnlySpan<float>.Empty;
-            return new ReadOnlySpan<float>((float*)_basePointer, Count * Dimensions);
+            byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
+            if (basePtr == null || Count == 0) return ReadOnlySpan<float>.Empty;
+            return new ReadOnlySpan<float>((float*)basePtr, Count * Dimensions);
         }
 
         public int GetChunkVectorCount(int chunkIndex) => Count;
@@ -192,8 +218,25 @@ namespace Glacier.Vector.Storage
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<float> GetVector(int index)
         {
+            byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
+            if (basePtr == null)
+            {
+                _rwLock.EnterReadLock();
+                try
+                {
+                    basePtr = (byte*)Volatile.Read(ref _basePointer);
+                }
+                finally
+                {
+                    _rwLock.ExitReadLock();
+                }
+            }
+
+            if (basePtr == null)
+                throw new InvalidOperationException("Storage is unmapped or disposed.");
+
             // Cast the byte pointer to a float pointer, then offset directly to the target vector
-            float* floatPtr = (float*)_basePointer;
+            float* floatPtr = (float*)basePtr;
             long offset = (long)index * Dimensions;
 
             // Returns a span pointing directly to the hard drive cache / physical memory
@@ -205,35 +248,43 @@ namespace Glacier.Vector.Storage
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            long bytesRequired = (long)(Count + 1) * Dimensions * sizeof(float);
-
-            // If we run out of space in the mapped file, we must unmap, grow the file, and remap
-            if (bytesRequired > _currentCapacityBytes)
+            _rwLock.EnterWriteLock();
+            try
             {
-                ExpandMapping();
+                long bytesRequired = (long)(Count + 1) * Dimensions * sizeof(float);
+
+                // If we run out of space in the mapped file, grow the file and map the expansion
+                if (bytesRequired > _currentCapacityBytes)
+                {
+                    ExpandMapping();
+                }
+
+                // Copy memory directly to the mapped file buffer
+                byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
+                float* floatPtr = (float*)basePtr;
+                long offset = (long)Count * Dimensions;
+
+                fixed (float* src = vector)
+                {
+                    System.Runtime.CompilerServices.Unsafe.CopyBlockUnaligned(
+                        floatPtr + offset,
+                        src,
+                        (uint)(Dimensions * sizeof(float)));
+                }
+
+                Count++;
             }
-
-            // Copy memory directly to the mapped file buffer
-            float* floatPtr = (float*)_basePointer;
-            long offset = (long)Count * Dimensions;
-
-            fixed (float* src = vector)
+            finally
             {
-                System.Runtime.CompilerServices.Unsafe.CopyBlockUnaligned(
-                    floatPtr + offset,
-                    src,
-                    (uint)(Dimensions * sizeof(float)));
+                _rwLock.ExitWriteLock();
             }
-
-            Count++;
         }
 
         private void ExpandMapping()
         {
-            // Release the current view and mapping lock
-            _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
-            _accessor.Dispose();
-            _mmf.Dispose();
+            // Keep previous mapping active to prevent 0xC0000005 access violations in active readers
+            if (_accessor != null) _oldAccessors.Add(_accessor);
+            if (_mmf != null) _oldMmfs.Add(_mmf);
 
             // Grow the physical file on disk by 1GB
             _currentCapacityBytes += GrowSize;
@@ -245,18 +296,40 @@ namespace Glacier.Vector.Storage
 
         public void Dispose()
         {
-            if (_basePointer != null)
+            _rwLock.EnterWriteLock();
+            try
             {
-                _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
-                _basePointer = null;
-            }
-            _accessor?.Dispose();
-            _mmf?.Dispose();
+                if (_basePointer != IntPtr.Zero)
+                {
+                    _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
+                    Volatile.Write(ref _basePointer, IntPtr.Zero);
+                }
+                _accessor?.Dispose();
+                _mmf?.Dispose();
 
-            // Truncate the file to exact size to save disk space before closing
-            long exactBytes = (long)Count * Dimensions * sizeof(float);
-            _fileStream?.SetLength(exactBytes);
-            _fileStream?.Dispose();
+                foreach (var acc in _oldAccessors)
+                {
+                    try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                    acc.Dispose();
+                }
+                _oldAccessors.Clear();
+
+                foreach (var m in _oldMmfs)
+                {
+                    m.Dispose();
+                }
+                _oldMmfs.Clear();
+
+                // Truncate the file to exact size to save disk space before closing
+                long exactBytes = (long)Count * Dimensions * sizeof(float);
+                try { _fileStream?.SetLength(exactBytes); } catch { }
+                _fileStream?.Dispose();
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+                _rwLock.Dispose();
+            }
         }
     }
 
