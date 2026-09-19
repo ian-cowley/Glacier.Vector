@@ -177,6 +177,12 @@ Glacier.Vector is designed to saturate your CPU's memory bandwidth during search
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
+## 🆕 What's New in v1.0.7
+
+- **HNSW and IVF-PQ indexes: zero-allocation inner loops** — all hot traversal and search loops now operate without heap allocations.
+- **`Volatile.Write` atomic pointer swap in `MmfVectorStorage`** — ensures safe concurrent access when swapping the active memory-mapped file segment.
+- **16 tests** passing (100 %).
+
 ## Credits
 
 Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
