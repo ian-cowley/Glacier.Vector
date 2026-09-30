@@ -50,6 +50,8 @@
 | **Batch Dot-Product Scan** | 50,000 vectors × 128 dims ($B=32$) | ~120 ms | 26.0 ms | **2.57 ms** | **622.7 M vec/s** | **10.1x** |
 | **Single Vector Scan** | 100,000 vectors × 128 dims | ~18 ms | 4.8 ms | **0.85 ms** | **117.6 M vec/s** | **5.6x** |
 | **L2 Euclidean Distance Scan**| 50,000 vectors × 128 dims ($B=32$) | ~145 ms | 31.2 ms | **3.10 ms** | **516.1 M vec/s** | **10.0x** |
+| **LLM 1536-Dim Batch Scan** | 100,000 vectors × 1536 dims ($B=64$) | ~1,850 ms | 388 ms | **566.2 ms (8.85 ms/q)** | **11.3 M vec/s** | **3.3x** |
+| **LLM 1536-Dim Single Scan** | 100,000 vectors × 1536 dims | ~32 ms | 8.77 ms | **7.81 ms** | **12.8 M vec/s** | **4.1x** |
 
 ---
 
