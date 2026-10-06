@@ -32,9 +32,12 @@ public sealed class HnswVectorIndex : IDisposable
     private int _enterNodeId = -1;
     private int _maxLayer = -1;
 
-    // Zero-allocation visited state tracker
-    private uint[] _visitedTags;
-    private uint _currentTag = 0;
+    // Thread-static scratch context for zero-allocation, thread-safe search traversal
+    [ThreadStatic]
+    private static HnswSearchScratch? t_scratch;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static HnswSearchScratch GetScratch() => t_scratch ??= new HnswSearchScratch();
 
     public int Dimensions => _storage.Dimensions;
     public int Count => _storage.Count;
@@ -58,7 +61,6 @@ public sealed class HnswVectorIndex : IDisposable
         Array.Fill(_layer0Edges, -1);
         _nodeMaxLayers = new int[cap];
         Array.Fill(_nodeMaxLayers, -1);
-        _visitedTags = new uint[cap];
 
         // If storage already contains vectors, index them
         for (int i = 0; i < storage.Count; i++)
@@ -148,13 +150,15 @@ public sealed class HnswVectorIndex : IDisposable
         }
 
         // Phase 2: From min(maxLayer, nodeLayer) down to layer 0: search efConstruction and connect
+        var scratch = GetScratch();
         for (int l = Math.Min(_maxLayer, nodeLayer); l >= 0; l--)
         {
-            var candidates = SearchLayer(vector, currObj, _efConstruction, l);
-            SelectAndLinkNeighbors(id, candidates, l);
-            if (candidates.Count > 0)
+            SearchLayer(vector, currObj, _efConstruction, l, scratch);
+            int bestCandidate = scratch.Results.FindMin().Id;
+            SelectAndLinkNeighbors(id, ref scratch.Results, l);
+            if (bestCandidate != -1)
             {
-                candidates.TryPeek(out currObj, out _);
+                currObj = bestCandidate;
             }
         }
 
@@ -166,18 +170,21 @@ public sealed class HnswVectorIndex : IDisposable
     }
 
     /// <summary>
-    /// Searches the HNSW graph for the top-K nearest neighbors.
+    /// Searches the HNSW graph for the top-K nearest neighbors, writing results directly into the destination span.
+    /// Performs zero GC heap allocations. Returns the number of results written.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public SearchResult[] Search(ReadOnlySpan<float> query, int topK, int efSearch = 64)
+    public int Search(ReadOnlySpan<float> query, Span<SearchResult> destination, int efSearch = 64)
     {
         if (query.Length != Dimensions)
             throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
+        if (destination.Length == 0) return 0;
+
         _rwLock.EnterReadLock();
         try
         {
-            if (_enterNodeId == -1 || topK <= 0) return Array.Empty<SearchResult>();
+            if (_enterNodeId == -1) return 0;
 
             int currObj = _enterNodeId;
             float currDist = ComputeDistance(query, _storage.GetVector(currObj));
@@ -206,30 +213,33 @@ public sealed class HnswVectorIndex : IDisposable
             }
 
             // Beam search at layer 0
+            int topK = destination.Length;
             int ef = Math.Max(efSearch, topK);
-            var w = SearchLayer(query, currObj, ef, 0);
+            var scratch = GetScratch();
+            SearchLayer(query, currObj, ef, 0, scratch);
 
+            ref var w = ref scratch.Results;
             int resultCount = Math.Min(topK, w.Count);
-            // Trim w down to topK best results
+
+            // Trim w down to topK best results (dequeue the worst results)
             while (w.Count > resultCount)
             {
-                w.Dequeue();
+                w.TryDequeue(out _, out _);
             }
 
-            var results = new SearchResult[resultCount];
             int metaCount = _metadata.Count;
 
-            // w is a min-heap on -distance, so Dequeue pops the farthest among the topK first.
-            // Populating backwards fills indices [resultCount-1 ... 0], placing highest score at index 0!
+            // w is a max-heap on distance, so TryDequeue pops the farthest among the topK first.
+            // Populating backwards fills destination[resultCount-1 ... 0], placing highest score (closest) at index 0!
             for (int i = resultCount - 1; i >= 0; i--)
             {
                 w.TryDequeue(out int id, out _);
                 float score = DistanceKernels.DotProduct(query, _storage.GetVector(id));
                 string meta = (id < metaCount) ? _metadata[id] : string.Empty;
-                results[i] = new SearchResult(id, score, meta);
+                destination[i] = new SearchResult(id, score, meta);
             }
 
-            return results;
+            return resultCount;
         }
         finally
         {
@@ -237,34 +247,61 @@ public sealed class HnswVectorIndex : IDisposable
         }
     }
 
-    private PriorityQueue<int, float> SearchLayer(
+    /// <summary>
+    /// Searches the HNSW graph for the top-K nearest neighbors.
+    /// Allocates the result array once and delegates to the zero-allocation overload.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public SearchResult[] Search(ReadOnlySpan<float> query, int topK, int efSearch = 64)
+    {
+        if (query.Length != Dimensions)
+            throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
+
+        if (_enterNodeId == -1 || topK <= 0) return Array.Empty<SearchResult>();
+
+        int count = Math.Min(topK, _storage.Count);
+        if (count <= 0) return Array.Empty<SearchResult>();
+
+        var results = new SearchResult[count];
+        int written = Search(query, results.AsSpan(), efSearch);
+        if (written < count)
+        {
+            Array.Resize(ref results, written);
+        }
+        return results;
+    }
+
+    private void SearchLayer(
         ReadOnlySpan<float> query,
         int enterNode,
         int ef,
-        int layer)
+        int layer,
+        HnswSearchScratch scratch)
     {
-        uint tag = Interlocked.Increment(ref _currentTag);
+        scratch.EnsureCapacity(_storage.Count, ef);
+
+        uint tag = ++scratch.CurrentTag;
         if (tag == 0)
         {
-            Array.Clear(_visitedTags, 0, _visitedTags.Length);
-            tag = Interlocked.Increment(ref _currentTag);
+            Array.Clear(scratch.VisitedTags, 0, scratch.VisitedTags.Length);
+            tag = ++scratch.CurrentTag;
         }
 
-        // candidates: Min-heap of positive distances (closest node popped first for greedy walk)
-        var candidates = new PriorityQueue<int, float>(ef + 1);
-        // results: Min-heap of negative distances (farthest node among best results at root for eviction)
-        var results = new PriorityQueue<int, float>(ef + 1);
+        ref var candidates = ref scratch.Candidates;
+        ref var results = ref scratch.Results;
+
+        candidates.Clear();
+        results.Clear();
 
         float dEnter = ComputeDistance(query, _storage.GetVector(enterNode));
         candidates.Enqueue(enterNode, dEnter);
-        results.Enqueue(enterNode, -dEnter);
-        _visitedTags[enterNode] = tag;
+        results.Enqueue(enterNode, dEnter);
+        scratch.VisitedTags[enterNode] = tag;
 
         while (candidates.Count > 0)
         {
             candidates.TryDequeue(out int c, out float dC);
-            results.TryPeek(out _, out float negWorstDist);
-            float worstDist = -negWorstDist;
+            results.Peek(out _, out float worstDist);
 
             if (results.Count >= ef && dC > worstDist) break;
 
@@ -274,36 +311,31 @@ public sealed class HnswVectorIndex : IDisposable
                 int e = neighbors[n];
                 if (e == -1) break;
 
-                if (_visitedTags[e] != tag)
+                if (scratch.VisitedTags[e] != tag)
                 {
-                    _visitedTags[e] = tag;
+                    scratch.VisitedTags[e] = tag;
                     float dE = ComputeDistance(query, _storage.GetVector(e));
 
-                    results.TryPeek(out _, out negWorstDist);
-                    worstDist = -negWorstDist;
+                    results.Peek(out _, out worstDist);
 
                     if (dE < worstDist || results.Count < ef)
                     {
                         candidates.Enqueue(e, dE);
-                        results.Enqueue(e, -dE);
+                        results.Enqueue(e, dE);
                         if (results.Count > ef)
                         {
-                            results.Dequeue();
+                            results.TryDequeue(out _, out _);
                         }
                     }
                 }
             }
         }
-
-        return results;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float ComputeDistance(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
-        // Cosine distance = 1.0f - DotProduct for normalized vectors
-        float dot = DistanceKernels.DotProduct(a, b);
-        return 1.0f - dot;
+        return DistanceKernels.CosineDistance(a, b);
     }
 
     private ReadOnlySpan<int> GetNeighbors(int id, int layer)
@@ -341,22 +373,22 @@ public sealed class HnswVectorIndex : IDisposable
         return arr.AsSpan(upperOffset, _m);
     }
 
-    private void SelectAndLinkNeighbors(int id, PriorityQueue<int, float> candidates, int layer)
+    private void SelectAndLinkNeighbors(int id, ref ValueMaxHeap results, int layer)
     {
         int maxConn = layer == 0 ? _m0 : _m;
 
-        // candidates contains elements with priority = -distance.
-        // Truncate to keep the maxConn closest items (those with largest negative distance, i.e. smallest positive distance).
-        while (candidates.Count > maxConn)
+        // results is a max-heap on distance (worst node at root).
+        // Truncate to keep the maxConn closest items (those with smallest distance).
+        while (results.Count > maxConn)
         {
-            candidates.Dequeue();
+            results.TryDequeue(out _, out _);
         }
 
-        int count = candidates.Count;
+        int count = results.Count;
         Span<int> selected = stackalloc int[count];
-        for (int i = 0; i < count; i++)
+        for (int i = count - 1; i >= 0; i--)
         {
-            candidates.TryDequeue(out int neighbor, out _);
+            results.TryDequeue(out int neighbor, out _);
             selected[i] = neighbor;
         }
 
@@ -421,7 +453,6 @@ public sealed class HnswVectorIndex : IDisposable
         int newCap = Math.Max(_nodeMaxLayers.Length * 2, requiredCount);
 
         Array.Resize(ref _nodeMaxLayers, newCap);
-        Array.Resize(ref _visitedTags, newCap);
 
         int oldL0Len = _layer0Edges.Length;
         Array.Resize(ref _layer0Edges, newCap * _m0);
@@ -440,5 +471,260 @@ public sealed class HnswVectorIndex : IDisposable
     public void Dispose()
     {
         _rwLock.Dispose();
+    }
+}
+
+/// <summary>
+/// Thread-static scratch workspace for zero-allocation HNSW graph search.
+/// </summary>
+internal sealed class HnswSearchScratch
+{
+    public uint CurrentTag;
+    public uint[] VisitedTags;
+    public ValueMinHeap Candidates;
+    public ValueMaxHeap Results;
+
+    public HnswSearchScratch(int initialNodes = 1024, int initialCapacity = 256)
+    {
+        CurrentTag = 0;
+        VisitedTags = new uint[initialNodes];
+        Candidates = new ValueMinHeap(new (int, float)[initialCapacity]);
+        Results = new ValueMaxHeap(new (int, float)[initialCapacity]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void EnsureCapacity(int nodeCount, int ef)
+    {
+        if (VisitedTags.Length < nodeCount)
+        {
+            int newCap = Math.Max(nodeCount + 256, VisitedTags.Length * 2);
+            Array.Resize(ref VisitedTags, newCap);
+        }
+        int minHeapCap = Math.Max(ef + 1, 256);
+        Candidates.EnsureCapacity(minHeapCap);
+        Results.EnsureCapacity(minHeapCap);
+    }
+}
+
+/// <summary>
+/// Zero-allocation, struct-based binary min-heap for (nodeId, distance) pairs.
+/// Root contains the item with the minimum distance.
+/// </summary>
+internal struct ValueMinHeap
+{
+    private (int Id, float Dist)[] _buffer;
+    private int _count;
+
+    public ValueMinHeap((int Id, float Dist)[] buffer)
+    {
+        _buffer = buffer;
+        _count = 0;
+    }
+
+    public readonly int Count => _count;
+    public readonly bool IsEmpty => _count == 0;
+    public readonly int Capacity => _buffer.Length;
+    internal (int Id, float Dist)[] Buffer => _buffer;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Clear() => _count = 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void EnsureCapacity(int minCapacity)
+    {
+        if (_buffer.Length < minCapacity)
+        {
+            Array.Resize(ref _buffer, Math.Max(minCapacity, _buffer.Length * 2));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Enqueue(int id, float dist)
+    {
+        if (_count == _buffer.Length)
+        {
+            Array.Resize(ref _buffer, Math.Max(4, _buffer.Length * 2));
+        }
+
+        int i = _count++;
+        while (i > 0)
+        {
+            int p = (i - 1) >> 1;
+            if (dist >= _buffer[p].Dist) break;
+            _buffer[i] = _buffer[p];
+            i = p;
+        }
+        _buffer[i] = (id, dist);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryDequeue(out int id, out float dist)
+    {
+        if (_count == 0)
+        {
+            id = -1;
+            dist = float.MaxValue;
+            return false;
+        }
+
+        id = _buffer[0].Id;
+        dist = _buffer[0].Dist;
+        _count--;
+
+        if (_count > 0)
+        {
+            var target = _buffer[_count];
+            int i = 0;
+            int half = _count >> 1;
+            while (i < half)
+            {
+                int child = (i << 1) + 1;
+                int right = child + 1;
+                if (right < _count && _buffer[right].Dist < _buffer[child].Dist)
+                {
+                    child = right;
+                }
+                if (target.Dist <= _buffer[child].Dist) break;
+                _buffer[i] = _buffer[child];
+                i = child;
+            }
+            _buffer[i] = target;
+        }
+
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool Peek(out int id, out float dist)
+    {
+        if (_count == 0)
+        {
+            id = -1;
+            dist = float.MaxValue;
+            return false;
+        }
+        id = _buffer[0].Id;
+        dist = _buffer[0].Dist;
+        return true;
+    }
+}
+
+/// <summary>
+/// Zero-allocation, struct-based binary max-heap for (nodeId, distance) pairs.
+/// Root contains the item with the maximum distance (worst candidate in top results).
+/// </summary>
+internal struct ValueMaxHeap
+{
+    private (int Id, float Dist)[] _buffer;
+    private int _count;
+
+    public ValueMaxHeap((int Id, float Dist)[] buffer)
+    {
+        _buffer = buffer;
+        _count = 0;
+    }
+
+    public readonly int Count => _count;
+    public readonly bool IsEmpty => _count == 0;
+    public readonly int Capacity => _buffer.Length;
+    internal (int Id, float Dist)[] Buffer => _buffer;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Clear() => _count = 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void EnsureCapacity(int minCapacity)
+    {
+        if (_buffer.Length < minCapacity)
+        {
+            Array.Resize(ref _buffer, Math.Max(minCapacity, _buffer.Length * 2));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Enqueue(int id, float dist)
+    {
+        if (_count == _buffer.Length)
+        {
+            Array.Resize(ref _buffer, Math.Max(4, _buffer.Length * 2));
+        }
+
+        int i = _count++;
+        while (i > 0)
+        {
+            int p = (i - 1) >> 1;
+            if (dist <= _buffer[p].Dist) break;
+            _buffer[i] = _buffer[p];
+            i = p;
+        }
+        _buffer[i] = (id, dist);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryDequeue(out int id, out float dist)
+    {
+        if (_count == 0)
+        {
+            id = -1;
+            dist = float.MinValue;
+            return false;
+        }
+
+        id = _buffer[0].Id;
+        dist = _buffer[0].Dist;
+        _count--;
+
+        if (_count > 0)
+        {
+            var target = _buffer[_count];
+            int i = 0;
+            int half = _count >> 1;
+            while (i < half)
+            {
+                int child = (i << 1) + 1;
+                int right = child + 1;
+                if (right < _count && _buffer[right].Dist > _buffer[child].Dist)
+                {
+                    child = right;
+                }
+                if (target.Dist >= _buffer[child].Dist) break;
+                _buffer[i] = _buffer[child];
+                i = child;
+            }
+            _buffer[i] = target;
+        }
+
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool Peek(out int id, out float dist)
+    {
+        if (_count == 0)
+        {
+            id = -1;
+            dist = float.MinValue;
+            return false;
+        }
+        id = _buffer[0].Id;
+        dist = _buffer[0].Dist;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly (int Id, float Dist) FindMin()
+    {
+        if (_count == 0) return (-1, float.MaxValue);
+        int bestId = _buffer[0].Id;
+        float bestDist = _buffer[0].Dist;
+        for (int i = 1; i < _count; i++)
+        {
+            if (_buffer[i].Dist < bestDist)
+            {
+                bestDist = _buffer[i].Dist;
+                bestId = _buffer[i].Id;
+            }
+        }
+        return (bestId, bestDist);
     }
 }

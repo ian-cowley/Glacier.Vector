@@ -1,12 +1,9 @@
-using Microsoft.Win32;
 using System;
-using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
-namespace Glacier.Vector.Compute
-{
+namespace Glacier.Vector.Compute;
     /// <summary>
     /// Hardware-accelerated kernels for vector distance calculations.
     /// </summary>
@@ -111,6 +108,15 @@ namespace Glacier.Vector.Compute
             }
 
             return dotProduct;
+        }
+
+        /// <summary>
+        /// Calculates the Cosine Distance between two vectors (1.0f - DotProduct for normalized embeddings).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float CosineDistance(ReadOnlySpan<float> target, ReadOnlySpan<float> databaseVector)
+        {
+            return 1.0f - DotProduct(target, databaseVector);
         }
 
         /// <summary>
@@ -230,5 +236,13 @@ namespace Glacier.Vector.Compute
 
             return distance;
         }
+
+        /// <summary>
+        /// Calculates the Euclidean (L2) distance between two vectors.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float L2Distance(ReadOnlySpan<float> target, ReadOnlySpan<float> databaseVector)
+        {
+            return MathF.Sqrt(L2DistanceSquared(target, databaseVector));
+        }
     }
-}
