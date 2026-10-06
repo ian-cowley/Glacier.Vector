@@ -179,6 +179,16 @@ Glacier.Vector is designed to saturate your CPU's memory bandwidth during search
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
+## 🆕 What's New in v1.0.8
+
+- **True Zero-Allocation HNSW Traversal** — Replaced per-query `PriorityQueue` heap allocations in `HnswVectorIndex.SearchLayer` with struct bounded heaps (`ValueMinHeap`, `ValueMaxHeap`) and `[ThreadStatic]` scratch buffers (`HnswSearchScratch`), achieving 0.0 bytes allocated per query.
+- **Zero-Allocation Search API** — Added `Search(ReadOnlySpan<float> query, Span<SearchResult> destination, int efSearch = 64)` overload.
+- **`Glacier.Vector.Benchmarks` Suite** — BenchmarkDotNet suite profiling SIMD vector distance kernels (AVX-512 / AVX2 / ARM Neon) and HNSW query throughput (41,398 QPS).
+- **Code Hygiene** — Removed dead `using Microsoft.Win32;` namespace import.
+- **62 unit tests** passing (100% green).
+
+---
+
 ## 🆕 What's New in v1.0.7
 
 - **HNSW and IVF-PQ indexes: zero-allocation inner loops** — all hot traversal and search loops now operate without heap allocations.
