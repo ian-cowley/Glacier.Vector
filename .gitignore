@@ -25,9 +25,16 @@ BenchmarkDotNet.Artifacts/
 # NuGet
 *.nupkg
 packages/
+nuget-local/
+
+# Secrets and configuration
+appsettings*.json
+!appsettings.template.json
+*.env*
 
 # Logs
 *.log
+mcp_log.txt
 ncrunch*
 
 # OS files

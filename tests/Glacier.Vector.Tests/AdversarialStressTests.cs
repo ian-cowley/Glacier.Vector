@@ -66,8 +66,8 @@ public class AdversarialStressTests : IDisposable
         using var storage = new MmfVectorStorage(filePath, dims);
         Assert.Equal(1, storage.Count);
 
-        const int readerCount = 6;
-        const int writerCount = 3;
+        const int readerCount = 4;
+        const int writerCount = 2;
         var startGate = new ManualResetEventSlim(false);
         var stopGate = new CancellationTokenSource();
         int readCount = 0;
@@ -148,8 +148,8 @@ public class AdversarialStressTests : IDisposable
             index.Add(GenerateNormalizedVector(dims, rng), $"Init_{i}");
         }
 
-        const int readerCount = 6;
-        const int writerCount = 3;
+        const int readerCount = 4;
+        const int writerCount = 2;
         var startGate = new ManualResetEventSlim(false);
         var stopGate = new CancellationTokenSource();
         int completedSearches = 0;

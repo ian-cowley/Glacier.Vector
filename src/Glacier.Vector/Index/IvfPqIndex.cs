@@ -266,22 +266,24 @@ public sealed class IvfPqIndex : IDisposable
 
             int actualProbe = Math.Clamp(nprobe, 1, CentroidCount);
 
-            // 1. Route to top-nprobe coarse centroids using SIMD Dot Product
-            Span<float> centroidScores = stackalloc float[CentroidCount];
+            // 1. Route to top-nprobe coarse centroids using minimum L2DistanceSquared
+            //    (matching TrainCoarseCentroids and Add Voronoi assignment).
+            //    PriorityQueue is a min-heap, so prioritizing by -dist evicts the farthest centroids
+            //    and retains the actualProbe closest centroids with zero stack/heap buffer allocation.
+            var topCentroids = new PriorityQueue<int, float>(actualProbe + 1);
+            float minNegDist = float.MinValue;
             for (int k = 0; k < CentroidCount; k++)
             {
                 ReadOnlySpan<float> centroid = _coarseCentroids.AsSpan(k * Dimensions, Dimensions);
-                centroidScores[k] = DistanceKernels.DotProduct(query, centroid);
-            }
-
-            // Min-heap to find top nprobe centroids with highest dot products
-            var topCentroids = new PriorityQueue<int, float>(actualProbe + 1);
-            for (int k = 0; k < CentroidCount; k++)
-            {
-                topCentroids.Enqueue(k, centroidScores[k]);
-                if (topCentroids.Count > actualProbe)
+                float negDist = -DistanceKernels.L2DistanceSquared(query, centroid);
+                if (topCentroids.Count < actualProbe || negDist > minNegDist)
                 {
-                    topCentroids.Dequeue();
+                    topCentroids.Enqueue(k, negDist);
+                    if (topCentroids.Count > actualProbe)
+                    {
+                        topCentroids.Dequeue();
+                        topCentroids.TryPeek(out _, out minNegDist);
+                    }
                 }
             }
 

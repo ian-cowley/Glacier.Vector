@@ -10,8 +10,8 @@ internal static class GpuVectorKernels
 // Based on NVVM 7.0.1
 //
 
-.version 9.3
-.target sm_89
+.version 7.5
+.target sm_75
 .address_size 64
 
 	// .globl	vector_dot_scan_fp32

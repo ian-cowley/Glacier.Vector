@@ -129,7 +129,7 @@ namespace Glacier.Vector.Tests
                 Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = 4;
                 Assert.Equal(Math.Min(4, Environment.ProcessorCount), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism());
 
-                Assert.Equal(2, Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism(requested: 2));
+                Assert.Equal(Math.Min(2, Environment.ProcessorCount), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism(requested: 2));
 
                 Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = -1;
                 Assert.Equal(Math.Max(1, Environment.ProcessorCount - 2), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism());

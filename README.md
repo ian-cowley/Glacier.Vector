@@ -33,7 +33,7 @@
 ## Key Features
 
 *   🚀 **SIMD-Accelerated Search**: Utilizes hardware intrinsics (AVX2, AVX-512) for lightning-fast brute-force vector comparisons (Cosine Similarity, Dot Product, Euclidean Distance).
-*   ⚡ **Bare-Metal GPU Batch Search**: Direct driver P/Invoke (`nvcuda.dll` and `amdhip64.dll`) offloading 2D grid batch scans (`vector_batch_dot_scan_fp32`) to NVIDIA RTX 4060 dGPU and AMD APUs without CUDA/ROCm SDK dependencies.
+*   ⚡ **Bare-Metal GPU Batch Search**: Direct driver P/Invoke (`nvcuda.dll` / `libcuda.so.1`) offloading 2D grid batch scans (`vector_batch_dot_scan_fp32`) to NVIDIA GPUs without CUDA SDK dependencies, with multi-core SIMD fallback.
 *   💾 **Persistent Device VRAM Caching**: Keeps database vectors resident in GPU memory across queries, bypassing host-to-device PCIe transfer penalties.
 *   📈 **Over 622 Million Vectors/sec**: Delivers 10.1x sustained speedup over multi-core AVX-512 CPU execution for large batch queries.
 *   🧠 **LLM Optimized**: Specifically designed to handle standard embedding dimensions (e.g., 1536 for OpenAI `text-embedding-3-small` or 768 for nomic-embed).
@@ -84,7 +84,7 @@ using var index = new VectorIndex(storage);
 
 ```csharp
 float[] vector = GetEmbeddings("Hello, world!");
-index.Add(vector, id: "doc_1", metadata: "Greeting message");
+index.Add(vector, metadata: "Greeting message");
 ```
 
 ### 3. Search
@@ -180,6 +180,15 @@ Glacier.Vector is designed to saturate your CPU's memory bandwidth during search
 ## Contributing
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## 🆕 What's New in v1.1.0
+
+- **Native AOT & Strict Build Hygiene** — Full `<IsAotCompatible>true</IsAotCompatible>` and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>`, replacing reflection JSON serialization in `McpServer` with zero-reflection `Utf8JsonWriter` / `JsonDocument` over Stdio.
+- **L2 Voronoi Routing in `IvfPqIndex`** — Coarse centroid probing now routes via minimum `L2DistanceSquared` matching K-Means Voronoi assignment, significantly improving recall.
+- **Safe Versioned VRAM Cache & `stackalloc` CUDA Launches** — Keyed GPU chunk caching by `(StorageId, ChunkIndex, Version)` and eliminated `GCHandle` boxing on kernel launches.
+- **Storage Bounds & Concurrency Hardening** — Atomic `ReaderWriterLockSlim` coordination in `VectorIndex` (with `leaveStorageOpen` support), bounds checks across all `IVectorStorage` backends, and 64-bit LRU counters in `PagedVectorStorage`.
+
+---
 
 ## 🆕 What's New in v1.0.8
 

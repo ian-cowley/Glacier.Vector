@@ -1,11 +1,10 @@
 using System;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Gpu.Compilation;
 using Glacier.Gpu.Drivers;
 using Glacier.Vector.Core;
 
@@ -13,8 +12,8 @@ namespace Glacier.Vector.Compute;
 
 /// <summary>
 /// Hardware accelerator engine for Glacier.Vector.
-/// Dispatches vector similarity scans and batch matrix operations to NVIDIA RTX 4060 dGPU,
-/// AMD Radeon 890M APU, or multi-core AVX-512 CPU.
+/// Dispatches vector similarity scans and batch matrix operations to CUDA-capable NVIDIA GPUs,
+/// with multi-core AVX-512 / AVX2 / Vector128 CPU fallback when GPU acceleration is unavailable.
 /// </summary>
 public static unsafe class GpuVectorAccelerator
 {
@@ -27,22 +26,27 @@ public static unsafe class GpuVectorAccelerator
     private static IntPtr s_fnBatchDotScan;
     private static IntPtr s_fnL2Scan;
 
-    // Persistent device buffer pool for high-throughput scans
+    // Persistent device buffer pool for high-throughput scans keyed by immutable storage identity + version
     private static IntPtr s_dQuery;
     private static IntPtr s_dDatabase;
     private static IntPtr s_dScores;
     private static nuint s_capQuery;
     private static nuint s_capDatabase;
     private static nuint s_capScores;
-    private static IntPtr s_lastUploadedDbPtr = IntPtr.Zero;
-    private static nuint s_lastUploadedDbBytes = 0;
-
-    private static bool s_amdInitialized;
-    private static bool s_amdAvailable;
+    private static long s_cachedStorageId;
+    private static int s_cachedChunkIndex = -1;
+    private static long s_cachedStorageVersion = -1;
+    private static nuint s_lastUploadedDbBytes;
 
     public static bool IsNvidiaAvailable => EnsureNvidiaInitialized();
-    public static bool IsAmdAvailable => EnsureAmdInitialized();
-    public static bool IsGpuAvailable => IsNvidiaAvailable || IsAmdAvailable;
+
+    /// <summary>
+    /// Gets whether an AMD GPU compute kernel backend is available for vector scans.
+    /// Returns false until native HIP/Vulkan compute kernels are loaded, ensuring callers use the multi-core SIMD path honestly.
+    /// </summary>
+    public static bool IsAmdAvailable => false;
+
+    public static bool IsGpuAvailable => IsNvidiaAvailable;
 
     #region Driver Initialization
 
@@ -57,46 +61,34 @@ public static unsafe class GpuVectorAccelerator
                 if (!CuDriver.IsAvailable())
                 {
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
                 if (CuDriver.Init(0) != 0)
                 {
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
                 if (CuDriver.DeviceGet(out int dev, 0) != 0)
                 {
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
-                CuDriver.DeviceGetAttribute(out int major, 75, dev);
-                CuDriver.DeviceGetAttribute(out int minor, 76, dev);
-                string targetArch = $"sm_{major}{minor}";
+                string targetArch = CuDriver.GetComputeCapability(dev);
 
                 if (CuDriver.CtxCreate(out s_cuContext, 0, dev) != 0)
                 {
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
-                string ptx = GpuVectorKernels.PtxSource;
-                if (!ptx.Contains($".target {targetArch}"))
-                {
-                    ptx = System.Text.RegularExpressions.Regex.Replace(ptx, @"\.target\s+sm_\d+", $".target {targetArch}");
-                }
-
+                string ptx = KernelCompiler.NormalizePtxDirectives(GpuVectorKernels.PtxSource, targetArch);
                 byte[] ptxBytes = Encoding.UTF8.GetBytes(ptx + "\0");
                 if (CuDriver.ModuleLoadData(out s_cuModule, ptxBytes) != 0)
                 {
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
@@ -105,7 +97,6 @@ public static unsafe class GpuVectorAccelerator
                     CuDriver.ModuleGetFunction(out s_fnL2Scan, s_cuModule, "vector_l2_scan_fp32") != 0)
                 {
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
@@ -121,45 +112,6 @@ public static unsafe class GpuVectorAccelerator
             }
 
             return s_nvidiaAvailable;
-        }
-    }
-
-    private static bool EnsureAmdInitialized()
-    {
-        if (s_amdInitialized) return s_amdAvailable;
-        lock (s_initLock)
-        {
-            if (s_amdInitialized) return s_amdAvailable;
-            try
-            {
-                if (!HipDriver.IsAvailable())
-                {
-                    s_amdAvailable = false;
-                    s_amdInitialized = true;
-                    return false;
-                }
-
-                HipDriver.Init(0);
-                if (HipDriver.GetDeviceCount(out int count) != 0 || count == 0)
-                {
-                    s_amdAvailable = false;
-                    s_amdInitialized = true;
-                    return false;
-                }
-
-                HipDriver.SetDevice(0);
-                s_amdAvailable = true;
-            }
-            catch
-            {
-                s_amdAvailable = false;
-            }
-            finally
-            {
-                s_amdInitialized = true;
-            }
-
-            return s_amdAvailable;
         }
     }
 
@@ -179,32 +131,41 @@ public static unsafe class GpuVectorAccelerator
         int dimensions,
         bool isL2Distance = false,
         GpuTarget target = GpuTarget.Auto)
+        => ScanChunkGpu(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance, target, storageId: 0, chunkIndex: 0, storageVersion: 0);
+
+    /// <summary>
+    /// Executes a brute-force similarity scan on GPU with explicit storage identity and mutation version for safe VRAM caching.
+    /// </summary>
+    public static bool ScanChunkGpu(
+        ReadOnlySpan<float> query,
+        ReadOnlySpan<float> chunkVectors,
+        Span<float> scores,
+        int vectorCount,
+        int dimensions,
+        bool isL2Distance,
+        GpuTarget target,
+        long storageId,
+        int chunkIndex,
+        long storageVersion)
     {
         if (vectorCount <= 0 || dimensions <= 0) return false;
+        if (query.Length < dimensions || chunkVectors.Length < vectorCount * dimensions || scores.Length < vectorCount)
+            return false;
 
         switch (target)
         {
             case GpuTarget.Cpu:
+            case GpuTarget.Amd:
                 return false;
 
             case GpuTarget.Nvidia:
-                return ExecuteNvidiaScan(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance);
-
-            case GpuTarget.Amd:
-                return ExecuteAmdScan(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance);
+                return ExecuteNvidiaScan(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance, storageId, chunkIndex, storageVersion);
 
             case GpuTarget.Auto:
             default:
-                // For small chunk counts (< 5,000 vectors), multi-core CPU AVX-512 is fast enough
                 if (vectorCount < 5_000) return false;
-
-                if (EnsureNvidiaInitialized() && ExecuteNvidiaScan(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance))
-                    return true;
-
-                if (EnsureAmdInitialized() && ExecuteAmdScan(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance))
-                    return true;
-
-                return false;
+                return EnsureNvidiaInitialized() &&
+                       ExecuteNvidiaScan(query, chunkVectors, scores, vectorCount, dimensions, isL2Distance, storageId, chunkIndex, storageVersion);
         }
     }
 
@@ -214,38 +175,53 @@ public static unsafe class GpuVectorAccelerator
         Span<float> scores,
         int vectorCount,
         int dimensions,
-        bool isL2Distance)
+        bool isL2Distance,
+        long storageId,
+        int chunkIndex,
+        long storageVersion)
     {
         if (!EnsureNvidiaInitialized()) return false;
 
         nuint bytesQuery = (nuint)(dimensions * sizeof(float));
-        nuint bytesDb = (nuint)(vectorCount * dimensions * sizeof(float));
+        nuint bytesDb = (nuint)((long)vectorCount * dimensions * sizeof(float));
         nuint bytesScores = (nuint)(vectorCount * sizeof(float));
-
-        CuDriver.CtxSetCurrent(s_cuContext);
 
         lock (s_initLock)
         {
+            CuDriver.CtxSetCurrent(s_cuContext);
+
             if (bytesQuery > s_capQuery)
             {
                 if (s_dQuery != IntPtr.Zero) CuDriver.MemFree(s_dQuery);
-                if (CuDriver.MemAlloc(out s_dQuery, bytesQuery) != 0) return false;
+                if (CuDriver.MemAlloc(out s_dQuery, bytesQuery) != 0)
+                {
+                    s_capQuery = 0;
+                    return false;
+                }
                 s_capQuery = bytesQuery;
             }
 
             if (bytesDb > s_capDatabase)
             {
                 if (s_dDatabase != IntPtr.Zero) CuDriver.MemFree(s_dDatabase);
-                if (CuDriver.MemAlloc(out s_dDatabase, bytesDb) != 0) return false;
+                if (CuDriver.MemAlloc(out s_dDatabase, bytesDb) != 0)
+                {
+                    s_capDatabase = 0;
+                    InvalidateDbCache();
+                    return false;
+                }
                 s_capDatabase = bytesDb;
-                s_lastUploadedDbPtr = IntPtr.Zero;
-                s_lastUploadedDbBytes = 0;
+                InvalidateDbCache();
             }
 
             if (bytesScores > s_capScores)
             {
                 if (s_dScores != IntPtr.Zero) CuDriver.MemFree(s_dScores);
-                if (CuDriver.MemAlloc(out s_dScores, bytesScores) != 0) return false;
+                if (CuDriver.MemAlloc(out s_dScores, bytesScores) != 0)
+                {
+                    s_capScores = 0;
+                    return false;
+                }
                 s_capScores = bytesScores;
             }
 
@@ -253,75 +229,72 @@ public static unsafe class GpuVectorAccelerator
             fixed (float* pDb = chunkVectors)
             fixed (float* pScores = scores)
             {
-                CuDriver.MemcpyHtoD(s_dQuery, (IntPtr)pQuery, bytesQuery);
+                if (CuDriver.MemcpyHtoD(s_dQuery, (IntPtr)pQuery, bytesQuery) != 0)
+                    return false;
 
-                if ((IntPtr)pDb != s_lastUploadedDbPtr || bytesDb != s_lastUploadedDbBytes)
+                bool cacheHit = storageId > 0 &&
+                                storageId == s_cachedStorageId &&
+                                chunkIndex == s_cachedChunkIndex &&
+                                storageVersion == s_cachedStorageVersion &&
+                                bytesDb == s_lastUploadedDbBytes;
+
+                if (!cacheHit)
                 {
-                    CuDriver.MemcpyHtoD(s_dDatabase, (IntPtr)pDb, bytesDb);
-                    s_lastUploadedDbPtr = (IntPtr)pDb;
-                    s_lastUploadedDbBytes = bytesDb;
+                    if (CuDriver.MemcpyHtoD(s_dDatabase, (IntPtr)pDb, bytesDb) != 0)
+                        return false;
+
+                    if (storageId > 0)
+                    {
+                        s_cachedStorageId = storageId;
+                        s_cachedChunkIndex = chunkIndex;
+                        s_cachedStorageVersion = storageVersion;
+                        s_lastUploadedDbBytes = bytesDb;
+                    }
+                    else
+                    {
+                        InvalidateDbCache();
+                    }
                 }
 
-                IntPtr[] kernelParams = new IntPtr[5];
-                GCHandle h0 = GCHandle.Alloc(s_dQuery, GCHandleType.Pinned);
-                GCHandle h1 = GCHandle.Alloc(s_dDatabase, GCHandleType.Pinned);
-                GCHandle h2 = GCHandle.Alloc(s_dScores, GCHandleType.Pinned);
-                GCHandle h3 = GCHandle.Alloc(vectorCount, GCHandleType.Pinned);
-                GCHandle h4 = GCHandle.Alloc(dimensions, GCHandleType.Pinned);
+                IntPtr dQuery = s_dQuery;
+                IntPtr dDatabase = s_dDatabase;
+                IntPtr dScores = s_dScores;
+                int vecCount = vectorCount;
+                int dims = dimensions;
 
-                kernelParams[0] = h0.AddrOfPinnedObject();
-                kernelParams[1] = h1.AddrOfPinnedObject();
-                kernelParams[2] = h2.AddrOfPinnedObject();
-                kernelParams[3] = h3.AddrOfPinnedObject();
-                kernelParams[4] = h4.AddrOfPinnedObject();
+                void** kernelParams = stackalloc void*[5];
+                kernelParams[0] = &dQuery;
+                kernelParams[1] = &dDatabase;
+                kernelParams[2] = &dScores;
+                kernelParams[3] = &vecCount;
+                kernelParams[4] = &dims;
 
-                GCHandle hArray = GCHandle.Alloc(kernelParams, GCHandleType.Pinned);
+                IntPtr fn = isL2Distance ? s_fnL2Scan : s_fnDotScan;
+                uint blockSize = 256;
+                uint gridSize = (uint)((vectorCount + 255) / 256);
 
-                try
-                {
-                    IntPtr fn = isL2Distance ? s_fnL2Scan : s_fnDotScan;
-                    uint blockSize = 256;
-                    uint gridSize = (uint)((vectorCount + 255) / 256);
+                int launchRes = CuDriver.LaunchKernel(
+                    fn,
+                    gridSize, 1, 1,
+                    blockSize, 1, 1,
+                    0, IntPtr.Zero,
+                    (IntPtr)kernelParams,
+                    IntPtr.Zero);
 
-                    int launchRes = CuDriver.LaunchKernel(
-                        fn,
-                        gridSize, 1, 1,
-                        blockSize, 1, 1,
-                        0, IntPtr.Zero,
-                        hArray.AddrOfPinnedObject(),
-                        IntPtr.Zero);
+                if (launchRes != 0) return false;
 
-                    if (launchRes != 0) return false;
-
-                    CuDriver.CtxSynchronize();
-                    CuDriver.MemcpyDtoH((IntPtr)pScores, s_dScores, bytesScores);
-                    return true;
-                }
-                finally
-                {
-                    hArray.Free();
-                    h0.Free();
-                    h1.Free();
-                    h2.Free();
-                    h3.Free();
-                    h4.Free();
-                }
+                CuDriver.StreamSynchronize(IntPtr.Zero);
+                return CuDriver.MemcpyDtoH((IntPtr)pScores, s_dScores, bytesScores) == 0;
             }
         }
     }
 
-    private static bool ExecuteAmdScan(
-        ReadOnlySpan<float> query,
-        ReadOnlySpan<float> chunkVectors,
-        Span<float> scores,
-        int vectorCount,
-        int dimensions,
-        bool isL2Distance)
+    private static void InvalidateDbCache()
     {
-        if (!EnsureAmdInitialized()) return false;
-
-        HipDriver.DeviceSynchronize();
-        return false; // Seamless fallback to AVX-512 CPU on APU
+        s_cachedStorageId = 0;
+        s_cachedChunkIndex = -1;
+        s_cachedStorageVersion = -1;
+        s_lastUploadedDbBytes = 0;
     }
 
     #endregion
@@ -334,38 +307,52 @@ public static unsafe class GpuVectorAccelerator
         Span<float> scoreMatrix,
         int vectorCount,
         int dimensions,
-        int batchSize)
+        int batchSize,
+        long storageId,
+        long storageVersion)
     {
         if (!EnsureNvidiaInitialized() || s_fnBatchDotScan == IntPtr.Zero) return false;
 
-        nuint bytesQuery = (nuint)(batchSize * dimensions * sizeof(float));
-        nuint bytesDb = (nuint)(vectorCount * dimensions * sizeof(float));
-        nuint bytesScores = (nuint)(vectorCount * batchSize * sizeof(float));
-
-        CuDriver.CtxSetCurrent(s_cuContext);
+        nuint bytesQuery = (nuint)((long)batchSize * dimensions * sizeof(float));
+        nuint bytesDb = (nuint)((long)vectorCount * dimensions * sizeof(float));
+        nuint bytesScores = (nuint)((long)vectorCount * batchSize * sizeof(float));
 
         lock (s_initLock)
         {
+            CuDriver.CtxSetCurrent(s_cuContext);
+
             if (bytesQuery > s_capQuery)
             {
                 if (s_dQuery != IntPtr.Zero) CuDriver.MemFree(s_dQuery);
-                if (CuDriver.MemAlloc(out s_dQuery, bytesQuery) != 0) return false;
+                if (CuDriver.MemAlloc(out s_dQuery, bytesQuery) != 0)
+                {
+                    s_capQuery = 0;
+                    return false;
+                }
                 s_capQuery = bytesQuery;
             }
 
             if (bytesDb > s_capDatabase)
             {
                 if (s_dDatabase != IntPtr.Zero) CuDriver.MemFree(s_dDatabase);
-                if (CuDriver.MemAlloc(out s_dDatabase, bytesDb) != 0) return false;
+                if (CuDriver.MemAlloc(out s_dDatabase, bytesDb) != 0)
+                {
+                    s_capDatabase = 0;
+                    InvalidateDbCache();
+                    return false;
+                }
                 s_capDatabase = bytesDb;
-                s_lastUploadedDbPtr = IntPtr.Zero;
-                s_lastUploadedDbBytes = 0;
+                InvalidateDbCache();
             }
 
             if (bytesScores > s_capScores)
             {
                 if (s_dScores != IntPtr.Zero) CuDriver.MemFree(s_dScores);
-                if (CuDriver.MemAlloc(out s_dScores, bytesScores) != 0) return false;
+                if (CuDriver.MemAlloc(out s_dScores, bytesScores) != 0)
+                {
+                    s_capScores = 0;
+                    return false;
+                }
                 s_capScores = bytesScores;
             }
 
@@ -373,62 +360,64 @@ public static unsafe class GpuVectorAccelerator
             fixed (float* pDb = chunkVectors)
             fixed (float* pScores = scoreMatrix)
             {
-                CuDriver.MemcpyHtoD(s_dQuery, (IntPtr)pQuery, bytesQuery);
+                if (CuDriver.MemcpyHtoD(s_dQuery, (IntPtr)pQuery, bytesQuery) != 0)
+                    return false;
 
-                if ((IntPtr)pDb != s_lastUploadedDbPtr || bytesDb != s_lastUploadedDbBytes)
+                bool cacheHit = storageId > 0 &&
+                                storageId == s_cachedStorageId &&
+                                s_cachedChunkIndex == 0 &&
+                                storageVersion == s_cachedStorageVersion &&
+                                bytesDb == s_lastUploadedDbBytes;
+
+                if (!cacheHit)
                 {
-                    CuDriver.MemcpyHtoD(s_dDatabase, (IntPtr)pDb, bytesDb);
-                    s_lastUploadedDbPtr = (IntPtr)pDb;
-                    s_lastUploadedDbBytes = bytesDb;
+                    if (CuDriver.MemcpyHtoD(s_dDatabase, (IntPtr)pDb, bytesDb) != 0)
+                        return false;
+
+                    if (storageId > 0)
+                    {
+                        s_cachedStorageId = storageId;
+                        s_cachedChunkIndex = 0;
+                        s_cachedStorageVersion = storageVersion;
+                        s_lastUploadedDbBytes = bytesDb;
+                    }
+                    else
+                    {
+                        InvalidateDbCache();
+                    }
                 }
 
-                IntPtr[] kernelParams = new IntPtr[6];
-                GCHandle h0 = GCHandle.Alloc(s_dQuery, GCHandleType.Pinned);
-                GCHandle h1 = GCHandle.Alloc(s_dDatabase, GCHandleType.Pinned);
-                GCHandle h2 = GCHandle.Alloc(s_dScores, GCHandleType.Pinned);
-                GCHandle h3 = GCHandle.Alloc(vectorCount, GCHandleType.Pinned);
-                GCHandle h4 = GCHandle.Alloc(dimensions, GCHandleType.Pinned);
-                GCHandle h5 = GCHandle.Alloc(batchSize, GCHandleType.Pinned);
+                IntPtr dQuery = s_dQuery;
+                IntPtr dDatabase = s_dDatabase;
+                IntPtr dScores = s_dScores;
+                int vecCount = vectorCount;
+                int dims = dimensions;
+                int bSize = batchSize;
 
-                kernelParams[0] = h0.AddrOfPinnedObject();
-                kernelParams[1] = h1.AddrOfPinnedObject();
-                kernelParams[2] = h2.AddrOfPinnedObject();
-                kernelParams[3] = h3.AddrOfPinnedObject();
-                kernelParams[4] = h4.AddrOfPinnedObject();
-                kernelParams[5] = h5.AddrOfPinnedObject();
+                void** kernelParams = stackalloc void*[6];
+                kernelParams[0] = &dQuery;
+                kernelParams[1] = &dDatabase;
+                kernelParams[2] = &dScores;
+                kernelParams[3] = &vecCount;
+                kernelParams[4] = &dims;
+                kernelParams[5] = &bSize;
 
-                GCHandle hArray = GCHandle.Alloc(kernelParams, GCHandleType.Pinned);
+                uint blockSizeX = 256;
+                uint gridDimX = (uint)((vectorCount + 255) / 256);
+                uint gridDimY = (uint)batchSize;
 
-                try
-                {
-                    uint blockSizeX = 256;
-                    uint gridDimX = (uint)((vectorCount + 255) / 256);
-                    uint gridDimY = (uint)batchSize;
+                int launchRes = CuDriver.LaunchKernel(
+                    s_fnBatchDotScan,
+                    gridDimX, gridDimY, 1,
+                    blockSizeX, 1, 1,
+                    0, IntPtr.Zero,
+                    (IntPtr)kernelParams,
+                    IntPtr.Zero);
 
-                    int launchRes = CuDriver.LaunchKernel(
-                        s_fnBatchDotScan,
-                        gridDimX, gridDimY, 1,
-                        blockSizeX, 1, 1,
-                        0, IntPtr.Zero,
-                        hArray.AddrOfPinnedObject(),
-                        IntPtr.Zero);
+                if (launchRes != 0) return false;
 
-                    if (launchRes != 0) return false;
-
-                    CuDriver.CtxSynchronize();
-                    CuDriver.MemcpyDtoH((IntPtr)pScores, s_dScores, bytesScores);
-                    return true;
-                }
-                finally
-                {
-                    hArray.Free();
-                    h0.Free();
-                    h1.Free();
-                    h2.Free();
-                    h3.Free();
-                    h4.Free();
-                    h5.Free();
-                }
+                CuDriver.StreamSynchronize(IntPtr.Zero);
+                return CuDriver.MemcpyDtoH((IntPtr)pScores, s_dScores, bytesScores) == 0;
             }
         }
     }
@@ -436,6 +425,7 @@ public static unsafe class GpuVectorAccelerator
     /// <summary>
     /// Executes high-throughput batch vector search: computes S = Database * Queries^T.
     /// Output scoreMatrix is shape [vectorCount, batchSize].
+    /// Returns true if executed on GPU; when target is Cpu or Auto without GPU, computes via multi-threaded SIMD CPU kernels if target == Cpu, or returns false when an explicit GPU target is unavailable.
     /// </summary>
     public static bool BatchScanGpu(
         ReadOnlySpan<float> chunkVectors,
@@ -445,26 +435,62 @@ public static unsafe class GpuVectorAccelerator
         int dimensions,
         int batchSize,
         GpuTarget target = GpuTarget.Auto)
+        => BatchScanGpu(chunkVectors, queries, scoreMatrix, vectorCount, dimensions, batchSize, target, storageId: 0, storageVersion: 0);
+
+    /// <summary>
+    /// Executes high-throughput batch vector search with explicit storage identity and mutation version for safe VRAM caching.
+    /// </summary>
+    public static bool BatchScanGpu(
+        ReadOnlySpan<float> chunkVectors,
+        ReadOnlySpan<float> queries,
+        Span<float> scoreMatrix,
+        int vectorCount,
+        int dimensions,
+        int batchSize,
+        GpuTarget target,
+        long storageId,
+        long storageVersion)
     {
         if (vectorCount <= 0 || dimensions <= 0 || batchSize <= 0) return false;
-
-        bool useGpu = target switch
+        if (chunkVectors.Length < vectorCount * dimensions ||
+            queries.Length < batchSize * dimensions ||
+            scoreMatrix.Length < vectorCount * batchSize)
         {
-            GpuTarget.Cpu => false,
-            GpuTarget.Nvidia => IsNvidiaAvailable,
-            GpuTarget.Amd => IsAmdAvailable,
-            _ => IsNvidiaAvailable || IsAmdAvailable
-        };
-
-        if (useGpu && IsNvidiaAvailable)
-        {
-            if (ExecuteNvidiaBatchScan(queries, chunkVectors, scoreMatrix, vectorCount, dimensions, batchSize))
-            {
-                return true;
-            }
+            return false;
         }
 
-        // Multi-threaded SIMD CPU fallback
+        switch (target)
+        {
+            case GpuTarget.Nvidia:
+                return ExecuteNvidiaBatchScan(queries, chunkVectors, scoreMatrix, vectorCount, dimensions, batchSize, storageId, storageVersion);
+
+            case GpuTarget.Amd:
+                return false;
+
+            case GpuTarget.Auto:
+                if (IsNvidiaAvailable && ExecuteNvidiaBatchScan(queries, chunkVectors, scoreMatrix, vectorCount, dimensions, batchSize, storageId, storageVersion))
+                {
+                    return true;
+                }
+                break;
+
+            case GpuTarget.Cpu:
+                break;
+        }
+
+        // Multi-threaded SIMD CPU execution for GpuTarget.Cpu and GpuTarget.Auto fallback
+        ExecuteCpuBatchScan(chunkVectors, queries, scoreMatrix, vectorCount, dimensions, batchSize);
+        return target == GpuTarget.Cpu || target == GpuTarget.Auto;
+    }
+
+    private static void ExecuteCpuBatchScan(
+        ReadOnlySpan<float> chunkVectors,
+        ReadOnlySpan<float> queries,
+        Span<float> scoreMatrix,
+        int vectorCount,
+        int dimensions,
+        int batchSize)
+    {
         fixed (float* pScores = scoreMatrix)
         fixed (float* pDb = chunkVectors)
         fixed (float* pQ = queries)
@@ -473,18 +499,18 @@ public static unsafe class GpuVectorAccelerator
             float* pD = pDb;
             float* pQueries = pQ;
 
-            Parallel.For(0, vectorCount, i =>
+            int parallelism = VectorConcurrency.GetEffectiveParallelism();
+            Parallel.For(0, vectorCount, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, i =>
             {
-                float* vRow = pD + i * dimensions;
+                float* vRow = pD + (long)i * dimensions;
                 int sOffset = i * batchSize;
                 for (int b = 0; b < batchSize; b++)
                 {
-                    float* qRow = pQueries + b * dimensions;
+                    float* qRow = pQueries + (long)b * dimensions;
                     pS[sOffset + b] = DotProductSimd(vRow, qRow, dimensions);
                 }
             });
         }
-        return true;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
@@ -520,6 +546,20 @@ public static unsafe class GpuVectorAccelerator
                 i += step;
             }
             sum += Vector256.Sum(acc256);
+        }
+        else if (Vector128.IsHardwareAccelerated && length >= Vector128<float>.Count)
+        {
+            var acc128 = Vector128<float>.Zero;
+            int step = Vector128<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector128.Load(a + i);
+                var vb = Vector128.Load(b + i);
+                acc128 = Vector128.FusedMultiplyAdd(va, vb, acc128);
+                i += step;
+            }
+            sum += Vector128.Sum(acc128);
         }
 
         for (; i < length; i++)

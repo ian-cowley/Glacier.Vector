@@ -34,42 +34,55 @@ namespace Glacier.Vector.Index
     }
 
     /// <summary>
-    /// The high-performance, multi-threaded search orchestrator.
-    /// Combines SIMD compute kernels with chunked Task parallelism.
+    /// High-performance, thread-safe multi-threaded vector search orchestrator.
+    /// Combines SIMD compute kernels and CUDA GPU offloading with chunked Task parallelism.
     /// </summary>
     public class VectorIndex : IDisposable
     {
         private readonly IVectorStorage _storage;
-
-        // Parallel list to hold metadata. Since vector IDs are sequential (0 to N-1),
-        // a simple List<string> is significantly faster and uses less memory than a Dictionary.
+        private readonly bool _leaveStorageOpen;
         private readonly List<string> _metadata;
         private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.SupportsRecursion);
-        private readonly object _writerLock = new();
+        private bool _disposed;
 
         public int Dimensions => _storage.Dimensions;
         public int Count => _storage.Count;
 
         public VectorIndex(IVectorStorage storage)
+            : this(storage, leaveStorageOpen: false)
+        {
+        }
+
+        public VectorIndex(IVectorStorage storage, bool leaveStorageOpen)
         {
             _storage = storage ?? throw new ArgumentNullException(nameof(storage));
+            _leaveStorageOpen = leaveStorageOpen;
             _metadata = new List<string>(storage.Count);
+            for (int i = 0; i < storage.Count; i++)
+            {
+                _metadata.Add(string.Empty);
+            }
         }
 
         /// <summary>
-        /// Appends a new vector and its associated metadata to the index.
-        /// Thread-safe for concurrent ingestion.
+        /// Appends a new vector and its associated metadata to the index atomically.
+        /// Thread-safe for concurrent ingestion and search.
         /// </summary>
         public void Add(ReadOnlySpan<float> vector, string metadata)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            _storage.Append(vector);
-
-            lock (_metadata)
+            _rwLock.EnterWriteLock();
+            try
             {
-                _metadata.Add(metadata);
+                _storage.Append(vector);
+                _metadata.Add(metadata ?? string.Empty);
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
             }
         }
 
@@ -95,18 +108,18 @@ namespace Glacier.Vector.Index
         /// Performs nearest neighbor search on the specified hardware target (Auto, Nvidia, Amd, or Cpu).
         /// </summary>
         public unsafe SearchResult[] Search(
-            ReadOnlySpan<float> query, 
-            int topK = 5, 
-            GpuTarget target = GpuTarget.Auto, 
+            ReadOnlySpan<float> query,
+            int topK = 5,
+            GpuTarget target = GpuTarget.Auto,
             int maxDegreeOfParallelism = 0)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
-            int totalCount = _storage.Count;
-            if (totalCount == 0 || topK <= 0) return Array.Empty<SearchResult>();
+            if (topK <= 0) return Array.Empty<SearchResult>();
 
-            if (target != GpuTarget.Cpu && totalCount >= 5_000 && GpuVectorAccelerator.IsGpuAvailable)
+            if (target != GpuTarget.Cpu && _storage.Count >= 5_000 && GpuVectorAccelerator.IsGpuAvailable)
             {
                 var gpuRes = TryGpuSearch(query, topK, target);
                 if (gpuRes != null) return gpuRes;
@@ -121,9 +134,14 @@ namespace Glacier.Vector.Index
             try
             {
                 int totalCount = _storage.Count;
+                if (totalCount == 0) return Array.Empty<SearchResult>();
+
                 int dims = Dimensions;
                 int chunkCount = _storage.ChunkCount;
+                if (chunkCount <= 0) return null;
 
+                long storageId = _storage.StorageId;
+                long storageVersion = _storage.Version;
                 var globalQueue = new PriorityQueue<int, float>(topK + 1);
 
                 int baseVectorIndex = 0;
@@ -137,7 +155,17 @@ namespace Glacier.Vector.Index
                     try
                     {
                         Span<float> scores = pooledScores.AsSpan(0, chunkVectors);
-                        if (!GpuVectorAccelerator.ScanChunkGpu(query, chunkSpan, scores, chunkVectors, dims, isL2Distance: false, target))
+                        if (!GpuVectorAccelerator.ScanChunkGpu(
+                            query,
+                            chunkSpan,
+                            scores,
+                            chunkVectors,
+                            dims,
+                            isL2Distance: false,
+                            target: target,
+                            storageId: storageId,
+                            chunkIndex: c,
+                            storageVersion: storageVersion))
                         {
                             return null;
                         }
@@ -193,19 +221,23 @@ namespace Glacier.Vector.Index
             int topK = 5,
             GpuTarget target = GpuTarget.Auto)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (batchSize <= 0 || topK <= 0)
+                return Array.Empty<SearchResult[]>();
+
             if (queries.Length < batchSize * Dimensions)
                 throw new ArgumentException("Queries span length does not match batchSize * Dimensions.");
 
-            int totalCount = _storage.Count;
-            if (totalCount == 0 || topK <= 0 || batchSize <= 0)
-                return Array.Empty<SearchResult[]>();
-
             var batchResults = new SearchResult[batchSize][];
 
-            if (target != GpuTarget.Cpu && totalCount >= 1024 && _storage.ChunkCount == 1 && GpuVectorAccelerator.IsGpuAvailable)
+            _rwLock.EnterReadLock();
+            try
             {
-                _rwLock.EnterReadLock();
-                try
+                int totalCount = _storage.Count;
+                if (totalCount == 0)
+                    return Array.Empty<SearchResult[]>();
+
+                if (target != GpuTarget.Cpu && totalCount >= 1024 && _storage.ChunkCount == 1 && GpuVectorAccelerator.IsGpuAvailable)
                 {
                     ReadOnlySpan<float> dbSpan = _storage.GetChunkSpan(0);
                     if (!dbSpan.IsEmpty)
@@ -217,11 +249,21 @@ namespace Glacier.Vector.Index
                         {
                             Span<float> scoreMatrix = pooledScoreMatrix.AsSpan(0, matrixLen);
 
-                            if (GpuVectorAccelerator.BatchScanGpu(dbSpan, queries, scoreMatrix, totalCount, Dimensions, batchSize, target))
+                            if (GpuVectorAccelerator.BatchScanGpu(
+                                dbSpan,
+                                queries,
+                                scoreMatrix,
+                                totalCount,
+                                Dimensions,
+                                batchSize,
+                                target: target == GpuTarget.Auto ? GpuTarget.Nvidia : target,
+                                storageId: _storage.StorageId,
+                                storageVersion: _storage.Version))
                             {
                                 int metaCount = _metadata.Count;
+                                int parallelism = VectorConcurrency.GetEffectiveParallelism();
 
-                                Parallel.For(0, batchSize, b =>
+                                Parallel.For(0, batchSize, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, b =>
                                 {
                                     var queue = new PriorityQueue<int, float>(topK + 1);
                                     float minScore = float.MinValue;
@@ -258,25 +300,26 @@ namespace Glacier.Vector.Index
                         }
                     }
                 }
-                finally
+
+                // Fallback: search each query on CPU under read lock
+                fixed (float* pQueries = queries)
                 {
-                    _rwLock.ExitReadLock();
+                    IntPtr queriesPtr = (IntPtr)pQueries;
+                    int dims = Dimensions;
+                    int parallelism = VectorConcurrency.GetEffectiveParallelism();
+                    Parallel.For(0, batchSize, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, b =>
+                    {
+                        ReadOnlySpan<float> q = new ReadOnlySpan<float>((float*)queriesPtr + ((long)b * dims), dims);
+                        batchResults[b] = SearchCpuLocked(q, totalCount, topK, maxDegreeOfParallelism: 1);
+                    });
                 }
-            }
 
-            // Fallback: search each query sequentially / parallel on CPU
-            fixed (float* pQueries = queries)
+                return batchResults;
+            }
+            finally
             {
-                IntPtr queriesPtr = (IntPtr)pQueries;
-                int dims = Dimensions;
-                Parallel.For(0, batchSize, b =>
-                {
-                    ReadOnlySpan<float> q = new ReadOnlySpan<float>((float*)queriesPtr + (b * dims), dims);
-                    batchResults[b] = Search(q, topK, GpuTarget.Cpu, maxDegreeOfParallelism: 1);
-                });
+                _rwLock.ExitReadLock();
             }
-
-            return batchResults;
         }
 
         private unsafe SearchResult[] SearchCpu(ReadOnlySpan<float> query, int topK, int maxDegreeOfParallelism)
@@ -284,13 +327,24 @@ namespace Glacier.Vector.Index
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
-            int totalCount = _storage.Count;
-            if (totalCount == 0 || topK <= 0) return Array.Empty<SearchResult>();
+            _rwLock.EnterReadLock();
+            try
+            {
+                int totalCount = _storage.Count;
+                if (totalCount == 0 || topK <= 0) return Array.Empty<SearchResult>();
+                return SearchCpuLocked(query, totalCount, topK, maxDegreeOfParallelism);
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
 
+        private unsafe SearchResult[] SearchCpuLocked(ReadOnlySpan<float> query, int totalCount, int topK, int maxDegreeOfParallelism)
+        {
             int parallelism = VectorConcurrency.GetEffectiveParallelism(maxDegreeOfParallelism);
             long totalOps = (long)totalCount * Dimensions;
 
-            // For small datasets or single-thread configuration, run sequentially with zero thread overhead
             if (parallelism <= 1 || totalOps < 32_768)
             {
                 return SearchChunk(query, 0, totalCount, topK);
@@ -305,12 +359,12 @@ namespace Glacier.Vector.Index
                 IntPtr queryPtr = (IntPtr)pQuery;
                 int dims = Dimensions;
 
-                var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                var parallelOptions = new ParallelOptions
                 {
                     MaxDegreeOfParallelism = parallelism
                 };
 
-                System.Threading.Tasks.Parallel.For(0, numChunks, parallelOptions, t =>
+                Parallel.For(0, numChunks, parallelOptions, t =>
                 {
                     int start = t * chunkSize;
                     int end = Math.Min(start + chunkSize, totalCount);
@@ -326,7 +380,6 @@ namespace Glacier.Vector.Index
                 });
             }
 
-            // Final Merge Phase: Combine the Top-K from all chunks
             var globalQueue = new PriorityQueue<SearchResult, float>(topK + 1);
 
             for (int t = 0; t < numChunks; t++)
@@ -344,7 +397,6 @@ namespace Glacier.Vector.Index
                 }
             }
 
-            // Extract from queue and sort descending
             var finalResults = new SearchResult[globalQueue.Count];
             for (int i = finalResults.Length - 1; i >= 0; i--)
             {
@@ -357,46 +409,34 @@ namespace Glacier.Vector.Index
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private SearchResult[] SearchChunk(ReadOnlySpan<float> querySpan, int start, int end, int topK)
         {
-            // .NET 6+ PriorityQueue is a Min-Heap. By prioritizing by Score, 
-            // the SMALLEST score stays at the top of the queue, making it perfectly
-            // positioned to be popped off when we exceed our topK capacity.
             var localQueue = new PriorityQueue<int, float>(topK + 1);
-
             float localMinScore = float.MinValue;
 
             for (int i = start; i < end; i++)
             {
                 ReadOnlySpan<float> dbVector = _storage.GetVector(i);
-
-                // Call our blazing-fast SIMD hardware intrinsics
                 float score = DistanceKernels.DotProduct(querySpan, dbVector);
 
-                // Hot-path optimization: bypass the PriorityQueue entirely 99.9% of the time
                 if (score > localMinScore || localQueue.Count < topK)
                 {
                     localQueue.Enqueue(i, score);
 
                     if (localQueue.Count > topK)
                     {
-                        localQueue.Dequeue(); // Remove the lowest score
-                        // Update the gatekeeper threshold
+                        localQueue.Dequeue();
                         localQueue.TryPeek(out _, out localMinScore);
                     }
                 }
             }
 
-            // Materialize the local results, fetching the metadata strings
             var results = new SearchResult[localQueue.Count];
             int idx = results.Length - 1;
+            int metaCount = _metadata.Count;
 
-            lock (_metadata)
+            while (localQueue.TryDequeue(out int id, out float score))
             {
-                int metaCount = _metadata.Count;
-                while (localQueue.TryDequeue(out int id, out float score))
-                {
-                    string meta = (id < metaCount) ? _metadata[id] : string.Empty;
-                    results[idx--] = new SearchResult(id, score, meta);
-                }
+                string meta = (id < metaCount) ? _metadata[id] : string.Empty;
+                results[idx--] = new SearchResult(id, score, meta);
             }
 
             return results;
@@ -404,8 +444,14 @@ namespace Glacier.Vector.Index
 
         public void Dispose()
         {
-            _storage?.Dispose();
-            _rwLock?.Dispose();
+            if (_disposed) return;
+            _disposed = true;
+
+            if (!_leaveStorageOpen)
+            {
+                _storage?.Dispose();
+            }
+            _rwLock.Dispose();
         }
     }
 }

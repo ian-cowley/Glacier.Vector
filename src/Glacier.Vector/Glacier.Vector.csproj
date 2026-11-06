@@ -3,27 +3,30 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
     <!-- NuGet Packaging Properties -->
-    <Version>1.0.7</Version>
+    <Version>1.1.0</Version>
     <PackageId>Glacier.Vector</PackageId>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier</Company>
-    <Description>High-performance, SIMD-accelerated vector search engine and index for .NET 10. Built for speed and efficiency with zero-copy semantics and MCP support.</Description>
-    <PackageTags>vector-search embeddings simd dotnet csharp high-performance semantic-search mcp</PackageTags>
+    <Description>High-performance, Native AOT-compatible SIMD &amp; CUDA-accelerated vector search engine (Flat, HNSW, IVF-PQ) and MCP server for .NET 10.</Description>
+    <PackageTags>vector-search embeddings simd hnsw ivf-pq cuda aot dotnet csharp high-performance semantic-search mcp</PackageTags>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Vector</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <!-- High Performance Optimizations -->
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <TieredPGO>true</TieredPGO>
-    <ServerGarbageCollection>true</ServerGarbageCollection>
-    <LangVersion>preview</LangVersion>
   </PropertyGroup>
+
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Gpu" Version="1.0.8" />
+    <PackageReference Include="Glacier.Gpu" Version="1.1.0" />
   </ItemGroup>
 </Project>

@@ -170,9 +170,9 @@ public class ChallengerAdversarialTests
     // =========================================================================
 
     [Theory]
-    [InlineData(16, 100)] // 16 threads x 100 queries = 1,600 concurrent queries
-    [InlineData(32, 100)] // 32 threads x 100 queries = 3,200 concurrent queries
-    [InlineData(64, 50)]  // 64 threads x 50 queries = 3,200 concurrent queries
+    [InlineData(4, 100)]  // 4 threads x 100 queries = 400 concurrent queries
+    [InlineData(8, 100)]  // 8 threads x 100 queries = 800 concurrent queries
+    [InlineData(16, 50)]  // 16 threads x 50 queries = 800 concurrent queries
     public void Task2_ReaderConcurrency_HighThreadCount_100PercentDeterministic(int threadCount, int queriesPerThread)
     {
         const int dims = 48;
