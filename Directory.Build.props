@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <Company>Glacier Software</Company>
+    <Product>Glacier .NET 10 Ecosystem</Product>
+    <Copyright>Copyright (c) 2026 Glacier Software</Copyright>
+    <Authors>Ian Cowley</Authors>
+    <Deterministic>true</Deterministic>
+    <NoWarn>$(NoWarn);CS1591;CS8981;CA2255;CS0105;xUnit1031;xUnit2013;CS8600;CS8602;CS8604;CS8618;CS8620;CS8605</NoWarn>
+  </PropertyGroup>
+</Project>

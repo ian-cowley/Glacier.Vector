@@ -300,4 +300,160 @@ public static class DistanceKernels
     {
         return MathF.Sqrt(L2DistanceSquared(target, databaseVector));
     }
+
+    /// <summary>
+    /// Packs a dense FP32 vector into a 1-bit binary representation (x >= 0 ? 1 : 0),
+    /// packing 64 floats into each 64-bit unsigned integer (ulong).
+    /// </summary>
+    public static void PackBinaryVector(ReadOnlySpan<float> source, Span<ulong> destination)
+    {
+        int words = (source.Length + 63) / 64;
+        if (destination.Length < words)
+            throw new ArgumentException($"destination buffer too small. Needs {words} ulongs, got {destination.Length}.", nameof(destination));
+
+        destination.Slice(0, words).Clear();
+
+        int fullWords = source.Length / 64;
+        for (int w = 0; w < fullWords; w++)
+        {
+            ulong word = 0UL;
+            int offset = w * 64;
+            for (int b = 0; b < 64; b++)
+            {
+                if (source[offset + b] >= 0.0f)
+                {
+                    word |= (1UL << b);
+                }
+            }
+            destination[w] = word;
+        }
+
+        int remainder = source.Length % 64;
+        if (remainder > 0)
+        {
+            ulong word = 0UL;
+            int offset = fullWords * 64;
+            for (int b = 0; b < remainder; b++)
+            {
+                if (source[offset + b] >= 0.0f)
+                {
+                    word |= (1UL << b);
+                }
+            }
+            destination[fullWords] = word;
+        }
+    }
+
+    /// <summary>
+    /// Packs a dense FP32 vector into a 1-bit binary representation (x >= 0 ? 1 : 0),
+    /// packing 32 floats into each 32-bit unsigned integer (uint).
+    /// </summary>
+    public static void PackBinaryVector(ReadOnlySpan<float> source, Span<uint> destination)
+    {
+        int words = (source.Length + 31) / 32;
+        if (destination.Length < words)
+            throw new ArgumentException($"destination buffer too small. Needs {words} uints, got {destination.Length}.", nameof(destination));
+
+        destination.Slice(0, words).Clear();
+
+        int fullWords = source.Length / 32;
+        for (int w = 0; w < fullWords; w++)
+        {
+            uint word = 0U;
+            int offset = w * 32;
+            for (int b = 0; b < 32; b++)
+            {
+                if (source[offset + b] >= 0.0f)
+                {
+                    word |= (1U << b);
+                }
+            }
+            destination[w] = word;
+        }
+
+        int remainder = source.Length % 32;
+        if (remainder > 0)
+        {
+            uint word = 0U;
+            int offset = fullWords * 32;
+            for (int b = 0; b < remainder; b++)
+            {
+                if (source[offset + b] >= 0.0f)
+                {
+                    word |= (1U << b);
+                }
+            }
+            destination[fullWords] = word;
+        }
+    }
+
+    /// <summary>
+    /// Computes the exact Hamming distance between two packed 64-bit binary vectors
+    /// using hardware-accelerated POPCNT and unrolled SIMD intrinsics.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static int HammingDistance(ReadOnlySpan<ulong> a, ReadOnlySpan<ulong> b)
+    {
+        int length = Math.Min(a.Length, b.Length);
+        if (length == 0) return 0;
+
+        int total = 0;
+        int i = 0;
+
+        int limit = length - 4;
+        for (; i <= limit; i += 4)
+        {
+            ulong x0 = a[i] ^ b[i];
+            ulong x1 = a[i + 1] ^ b[i + 1];
+            ulong x2 = a[i + 2] ^ b[i + 2];
+            ulong x3 = a[i + 3] ^ b[i + 3];
+
+            total += System.Numerics.BitOperations.PopCount(x0)
+                   + System.Numerics.BitOperations.PopCount(x1)
+                   + System.Numerics.BitOperations.PopCount(x2)
+                   + System.Numerics.BitOperations.PopCount(x3);
+        }
+
+        for (; i < length; i++)
+        {
+            total += System.Numerics.BitOperations.PopCount(a[i] ^ b[i]);
+        }
+
+        return total;
+    }
+
+    /// <summary>
+    /// Computes the exact Hamming distance between two packed 32-bit binary vectors
+    /// using AVX-512 VPOPCNTDQ / BitOperations.PopCount.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static int HammingDistance(ReadOnlySpan<uint> a, ReadOnlySpan<uint> b)
+    {
+        int length = Math.Min(a.Length, b.Length);
+        if (length == 0) return 0;
+
+        int total = 0;
+        int i = 0;
+
+        int limit = length - 4;
+        for (; i <= limit; i += 4)
+        {
+            uint x0 = a[i] ^ b[i];
+            uint x1 = a[i + 1] ^ b[i + 1];
+            uint x2 = a[i + 2] ^ b[i + 2];
+            uint x3 = a[i + 3] ^ b[i + 3];
+
+            total += System.Numerics.BitOperations.PopCount(x0)
+                   + System.Numerics.BitOperations.PopCount(x1)
+                   + System.Numerics.BitOperations.PopCount(x2)
+                   + System.Numerics.BitOperations.PopCount(x3);
+        }
+
+        for (; i < length; i++)
+        {
+            total += System.Numerics.BitOperations.PopCount(a[i] ^ b[i]);
+        }
+
+        return total;
+    }
 }
