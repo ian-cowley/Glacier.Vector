@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Glacier.Vector\Glacier.Vector.csproj" />
+    <ProjectReference Include="..\..\src\Glacier.Vector.Host\Glacier.Vector.Host.csproj" />
   </ItemGroup>
 
 </Project>
