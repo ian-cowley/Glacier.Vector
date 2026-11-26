@@ -48,5 +48,6 @@ scratch/
 bin/
 obj/
 TestResults/
+artifacts/
 *.tmp
 !.env.example

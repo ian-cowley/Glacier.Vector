@@ -724,5 +724,187 @@ $L__BB2_16:
 
 }
 
+	// .globl	vector_dot_scan_splitk_fp32
+	// Contiguous warp-cooperative Split-K FP32 dot-product scan (1 warp = 32 lanes per DB vector).
+	// Coalesces 128-byte cache lines across all 32 lanes and reduces via shfl.sync.bfly.b32.
+.visible .entry vector_dot_scan_splitk_fp32(
+	.param .u64 p_query,
+	.param .u64 p_database,
+	.param .u64 p_scores,
+	.param .u32 p_vecCount,
+	.param .u32 p_dims
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .f32 	%f<8>;
+	.reg .b32 	%r<16>;
+	.reg .b64 	%rd<12>;
+
+	ld.param.u64 	%rd1, [p_query];
+	ld.param.u64 	%rd2, [p_database];
+	ld.param.u64 	%rd3, [p_scores];
+	ld.param.u32 	%r1, [p_vecCount];
+	ld.param.u32 	%r2, [p_dims];
+
+	cvta.to.global.u64 	%rd4, %rd1;
+	cvta.to.global.u64 	%rd5, %rd2;
+	cvta.to.global.u64 	%rd6, %rd3;
+
+	mov.u32 	%r3, %tid.x;
+	and.b32 	%r4, %r3, 31;           // lane = tid.x & 31
+	shr.u32 	%r5, %r3, 5;            // warpInBlock = tid.x >> 5
+	mov.u32 	%r6, %ntid.x;
+	shr.u32 	%r7, %r6, 5;            // warpsPerBlock = blockDim.x >> 5
+	mov.u32 	%r8, %ctaid.x;
+	mad.lo.u32 	%r9, %r8, %r7, %r5;     // vecIdx = blockIdx.x * warpsPerBlock + warpInBlock
+
+	setp.ge.u32 	%p1, %r9, %r1;
+	@%p1 bra 	$L_SK_EXIT;
+
+	// dbRow = database + (int64)vecIdx * dims * 4
+	mul.wide.u32 	%rd7, %r9, %r2;
+	shl.b64 	%rd8, %rd7, 2;
+	add.u64 	%rd9, %rd5, %rd8;
+
+	mov.f32 	%f1, 0f00000000;        // acc = 0.0f
+	mov.u32 	%r10, %r4;              // d = lane
+
+	setp.ge.u32 	%p2, %r10, %r2;
+	@%p2 bra 	$L_SK_REDUCE;
+
+$L_SK_LOOP:
+	mul.wide.u32 	%rd10, %r10, 4;
+	add.u64 	%rd11, %rd4, %rd10;
+	ld.global.nc.f32 	%f2, [%rd11];
+	add.u64 	%rd11, %rd9, %rd10;
+	ld.global.nc.f32 	%f3, [%rd11];
+	fma.rn.f32 	%f1, %f2, %f3, %f1;
+	add.u32 	%r10, %r10, 32;
+	setp.lt.u32 	%p3, %r10, %r2;
+	@%p3 bra 	$L_SK_LOOP;
+
+$L_SK_REDUCE:
+	mov.b32 	%r11, %f1;
+	shfl.sync.bfly.b32 	%r12, %r11, 16, 0x1f, 0xffffffff;
+	mov.b32 	%f4, %r12;
+	add.f32 	%f1, %f1, %f4;
+
+	mov.b32 	%r11, %f1;
+	shfl.sync.bfly.b32 	%r12, %r11, 8, 0x1f, 0xffffffff;
+	mov.b32 	%f4, %r12;
+	add.f32 	%f1, %f1, %f4;
+
+	mov.b32 	%r11, %f1;
+	shfl.sync.bfly.b32 	%r12, %r11, 4, 0x1f, 0xffffffff;
+	mov.b32 	%f4, %r12;
+	add.f32 	%f1, %f1, %f4;
+
+	mov.b32 	%r11, %f1;
+	shfl.sync.bfly.b32 	%r12, %r11, 2, 0x1f, 0xffffffff;
+	mov.b32 	%f4, %r12;
+	add.f32 	%f1, %f1, %f4;
+
+	mov.b32 	%r11, %f1;
+	shfl.sync.bfly.b32 	%r12, %r11, 1, 0x1f, 0xffffffff;
+	mov.b32 	%f4, %r12;
+	add.f32 	%f1, %f1, %f4;
+
+	setp.ne.u32 	%p2, %r4, 0;
+	@%p2 bra 	$L_SK_EXIT;
+
+	mul.wide.u32 	%rd10, %r9, 4;
+	add.u64 	%rd11, %rd6, %rd10;
+	st.global.f32 	[%rd11], %f1;
+
+$L_SK_EXIT:
+	ret;
+}
+
+	// .globl	vector_dot_scan_int8_dp4a
+	// Zero-I2F contiguous warp Split-K INT8 quantized dot-product scan using hardware dp4a.s32.s32.
+	// Processes 128 int8 elements per warp per loop iteration with a single I2F conversion on lane 0.
+.visible .entry vector_dot_scan_int8_dp4a(
+	.param .u64 p_queryPacked,
+	.param .u64 p_dbPacked,
+	.param .u64 p_scores,
+	.param .u32 p_vecCount,
+	.param .u32 p_dimsDiv4,
+	.param .f32 p_combinedScale
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .f32 	%f<4>;
+	.reg .s32 	%r<16>;
+	.reg .b64 	%rd<12>;
+
+	ld.param.u64 	%rd1, [p_queryPacked];
+	ld.param.u64 	%rd2, [p_dbPacked];
+	ld.param.u64 	%rd3, [p_scores];
+	ld.param.u32 	%r1, [p_vecCount];
+	ld.param.u32 	%r2, [p_dimsDiv4];
+	ld.param.f32 	%f1, [p_combinedScale];
+
+	cvta.to.global.u64 	%rd4, %rd1;
+	cvta.to.global.u64 	%rd5, %rd2;
+	cvta.to.global.u64 	%rd6, %rd3;
+
+	mov.u32 	%r3, %tid.x;
+	and.b32 	%r4, %r3, 31;           // lane = tid.x & 31
+	shr.u32 	%r5, %r3, 5;            // warpInBlock = tid.x >> 5
+	mov.u32 	%r6, %ntid.x;
+	shr.u32 	%r7, %r6, 5;            // warpsPerBlock
+	mov.u32 	%r8, %ctaid.x;
+	mad.lo.u32 	%r9, %r8, %r7, %r5;     // vecIdx
+
+	setp.ge.u32 	%p1, %r9, %r1;
+	@%p1 bra 	$L_DP4A_EXIT;
+
+	// dbRow = dbPacked + (uint64)vecIdx * dimsDiv4 * 4
+	mul.wide.u32 	%rd7, %r9, %r2;
+	shl.b64 	%rd8, %rd7, 2;
+	add.u64 	%rd9, %rd5, %rd8;
+
+	mov.s32 	%r11, 0;                // acc = 0 (int32, zero I2F in loop)
+	mov.u32 	%r10, %r4;              // w = lane
+
+	setp.ge.u32 	%p2, %r10, %r2;
+	@%p2 bra 	$L_DP4A_REDUCE;
+
+$L_DP4A_LOOP:
+	mul.wide.u32 	%rd10, %r10, 4;
+	add.u64 	%rd11, %rd4, %rd10;
+	ld.global.nc.u32 	%r12, [%rd11];
+	add.u64 	%rd11, %rd9, %rd10;
+	ld.global.nc.u32 	%r13, [%rd11];
+	dp4a.s32.s32 	%r11, %r12, %r13, %r11;
+	add.u32 	%r10, %r10, 32;
+	setp.lt.u32 	%p3, %r10, %r2;
+	@%p3 bra 	$L_DP4A_LOOP;
+
+$L_DP4A_REDUCE:
+	shfl.sync.bfly.b32 	%r14, %r11, 16, 0x1f, 0xffffffff;
+	add.s32 	%r11, %r11, %r14;
+	shfl.sync.bfly.b32 	%r14, %r11, 8, 0x1f, 0xffffffff;
+	add.s32 	%r11, %r11, %r14;
+	shfl.sync.bfly.b32 	%r14, %r11, 4, 0x1f, 0xffffffff;
+	add.s32 	%r11, %r11, %r14;
+	shfl.sync.bfly.b32 	%r14, %r11, 2, 0x1f, 0xffffffff;
+	add.s32 	%r11, %r11, %r14;
+	shfl.sync.bfly.b32 	%r14, %r11, 1, 0x1f, 0xffffffff;
+	add.s32 	%r11, %r11, %r14;
+
+	setp.ne.u32 	%p2, %r4, 0;
+	@%p2 bra 	$L_DP4A_EXIT;
+
+	cvt.rn.f32.s32 	%f2, %r11;
+	mul.f32 	%f3, %f2, %f1;
+	mul.wide.u32 	%rd10, %r9, 4;
+	add.u64 	%rd11, %rd6, %rd10;
+	st.global.f32 	[%rd11], %f3;
+
+$L_DP4A_EXIT:
+	ret;
+}
+
 ";
 }

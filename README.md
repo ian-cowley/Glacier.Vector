@@ -33,7 +33,9 @@
 ## Key Features
 
 *   🚀 **SIMD-Accelerated Search**: Utilizes hardware intrinsics (AVX2, AVX-512) for lightning-fast brute-force vector comparisons (Cosine Similarity, Dot Product, Euclidean Distance).
-*   ⚡ **Bare-Metal GPU Batch Search**: Direct driver P/Invoke (`nvcuda.dll` / `libcuda.so.1`) offloading 2D grid batch scans (`vector_batch_dot_scan_fp32`) to NVIDIA GPUs without CUDA SDK dependencies, with multi-core SIMD fallback.
+*   ⚡ **Bare-Metal GPU Batch & Quantized Scan**: Direct driver P/Invoke (`nvcuda.dll` / `libcuda.so.1`) offloading 2D batch scans, Split-K FP32 (`dimensions >= 128`), and zero-`I2F` `dp4a.s32.s32` INT8 scans (`ScanChunkInt8Gpu`) to NVIDIA GPUs with multi-core SIMD fallback.
+*   🌀 **Hadamard & RaBitQ 1-Bit Compression (`HadamardProjection`)**: AVX-512F / AVX2 normalized FWHT random rotation (`ApplyFwhtInPlace`, `RotateAndBinarize`) packing 32&times; compressed 1-bit codes with asymmetric dot/cosine estimation.
+*   🔢 **Sub-Byte Quantized Distance Kernels (`DistanceKernels`)**: AVX-512BW / AVX2 / 32-bit SWAR `DotInt8`, `SumInt8`, `DotInt8Quantized`, `DotUInt4Packed`, `SumUInt4Packed`, and `DotUInt4PackedQuantized`.
 *   💾 **Persistent Device VRAM Caching**: Keeps database vectors resident in GPU memory across queries, bypassing host-to-device PCIe transfer penalties.
 *   📈 **Over 622 Million Vectors/sec**: Delivers 10.1x sustained speedup over multi-core AVX-512 CPU execution for large batch queries.
 *   🧠 **LLM Optimized**: Specifically designed to handle standard embedding dimensions (e.g., 1536 for OpenAI `text-embedding-3-small` or 768 for nomic-embed).
@@ -54,6 +56,22 @@
 | **L2 Euclidean Distance Scan**| 50,000 vectors × 128 dims ($B=32$) | ~145 ms | 31.2 ms | **3.10 ms** | **516.1 M vec/s** | **10.0x** |
 | **LLM 1536-Dim Batch Scan** | 100,000 vectors × 1536 dims ($B=64$) | ~1,850 ms | 388 ms | **566.2 ms (8.85 ms/q)** | **11.3 M vec/s** | **3.3x** |
 | **LLM 1536-Dim Single Scan** | 100,000 vectors × 1536 dims | ~32 ms | 8.77 ms | **7.81 ms** | **12.8 M vec/s** | **4.1x** |
+
+### Empirical Quantized, Hadamard & Split-K Scan Benchmarks (Nov 2026)
+
+Measured via `dotnet run --project benchmarks/Glacier.Vector.Benchmarks/Glacier.Vector.Benchmarks.csproj -c Release`:
+
+| Kernel / Path | Workload | Measured Latency | Throughput |
+| :--- | :--- | :---: | :---: |
+| **CPU SIMD `DotProduct` vs `DotInt8` vs `DotUInt4Packed`** | Single pair, `Dim = 1536` | **61.9 ns** / **24.2 ns** / **4.8 ns** | **16.2 / 41.3 / 210.0 MOps/s** (`DotUInt4Packed` 13.0&times; faster than FP32) |
+| **CPU SIMD `DotProduct` vs `DotInt8` vs `DotUInt4Packed`** | Single pair, `Dim = 768` | **32.4 ns** / **12.1 ns** / **3.0 ns** | **30.9 / 82.9 / 336.2 MOps/s** |
+| **`HadamardProjection.ApplyFwhtInPlace` / `RotateAndBinarize`** | `Dim = 128` (`pad 128`) | **0.03 &mu;s** / **0.10 &mu;s** | **29.79M / 9.58M vec/s** |
+| **`HadamardProjection.ApplyFwhtInPlace` / `RotateAndBinarize`** | `Dim = 1536` (`pad 2048`) | **0.63 &mu;s** / **1.17 &mu;s** | **1.58M / 851.9 kVec/s** |
+| **Chunk Scan: `Dim = 128`, 100,000 vectors** | CPU FP32 / CPU INT8 / GPU Split-K FP32 (cached) / GPU `dp4a` INT8 (incl. H2D) | **0.96 / 0.35 / 0.49 / 1.19 ms** | **103.8 / 286.8 / 202.2 / 84.2 M vec/s** |
+| **Chunk Scan: `Dim = 1536`, 100,000 vectors** | CPU FP32 / CPU INT8 / GPU Split-K FP32 (cached) / GPU `dp4a` INT8 (incl. H2D) | **7.84 / 2.58 / 5.04 / 12.57 ms** | **12.8 / 38.7 / 19.8 / 8.0 M vec/s** |
+| **HNSW Index Search (`10,000` queries, `2k x 128D`)** | Allocating vs Zero-Alloc `Span<SearchResult>` | **35.1 &mu;s** vs **23.7 &mu;s** | **28,454 QPS** (184 B/q) vs **42,109 QPS** (**0 B/q**) |
+
+Note: `ScanChunkInt8Gpu` invalidates the cached DB buffer per call and pays the host-to-device PCIe copy (`12.8 MB` at `128D`, `153.6 MB` at `1536D`), making multi-core CPU SIMD INT8 (`0.35 ms` / `2.58 ms`) faster on uncached single scans, whereas cached VRAM `Split-K FP32` (`0.49 ms` / `5.04 ms`) beats CPU FP32 (`0.96 ms` / `7.84 ms`) by `1.56x–1.96x`.
 
 ---
 
@@ -181,6 +199,15 @@ Glacier.Vector is designed to saturate your CPU's memory bandwidth during search
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
+## 🆕 What's New in v1.3.0
+
+- **Hadamard & RaBitQ 1-Bit Compression (`HadamardProjection`)** — AVX-512F / AVX2 normalized FWHT random rotation (`ApplyFwhtInPlace`, `ApplyRandomRotation`, `RotateAndBinarize`) packing 32&times; compressed 1-bit codes with asymmetric inner-product/cosine estimation (`EstimateCosineFromHamming`, `EstimateAsymmetricCosine`).
+- **INT8 & Packed UINT4 Kernels (`DistanceKernels`)** — AVX-512BW / AVX2 (`vpmaddubsw` + `vpmaddwd`) / portable 32-bit SWAR kernels (`DotInt8`, `SumInt8`, `DotInt8Quantized`, `DotFloatInt8`, `PackUInt4`, `DotUInt4Packed`, `SumUInt4Packed`, `DotUInt4PackedQuantized`).
+- **GPU Split-K FP32 & Zero-`I2F` `dp4a` INT8 Scans (`GpuVectorAccelerator`)** — Warp-cooperative Split-K FP32 (`dimensions >= 128`) and `ScanChunkInt8Gpu` (`dp4a.s32.s32`) with multi-threaded SIMD CPU fallback.
+- **140 unit tests** passing (100% green).
+
+---
+
 ## 🆕 What's New in v1.1.0
 
 - **Native AOT & Strict Build Hygiene** — Full `<IsAotCompatible>true</IsAotCompatible>` and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>`, replacing reflection JSON serialization in `McpServer` with zero-reflection `Utf8JsonWriter` / `JsonDocument` over Stdio.
@@ -196,7 +223,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for deta
 - **Zero-Allocation Search API** — Added `Search(ReadOnlySpan<float> query, Span<SearchResult> destination, int efSearch = 64)` overload.
 - **`Glacier.Vector.Benchmarks` Suite** — BenchmarkDotNet suite profiling SIMD vector distance kernels (AVX-512 / AVX2 / ARM Neon) and HNSW query throughput (41,398 QPS).
 - **Code Hygiene** — Removed dead `using Microsoft.Win32;` namespace import.
-- **62 unit tests** passing (100% green).
+- **140 unit tests** passing (100% green, including Hadamard/RaBitQ, INT8/UINT4 SWAR+SIMD parity, Split-K FP32 & `dp4a` INT8 CUDA parity).
 
 ---
 

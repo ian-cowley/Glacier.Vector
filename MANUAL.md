@@ -26,12 +26,12 @@ Glacier.Vector abstracts vector storage via the `IVectorStorage` interface. This
 
 ---
 
-## 2. Distance Kernels & SIMD acceleration
+## 2. Distance Kernels, Quantization & Hadamard Rotation
 
-Glacier.Vector uses optimized SIMD kernels for distance computations (e.g., `DistanceKernels.DotProduct`).
-- Automatically leverages **AVX2 / AVX-512** instructions when running on supported processors.
-- Aggressively optimized with `.NET` `MethodImplOptions.AggressiveOptimization` and `AggressiveInlining` annotations.
-- Achieves peak floating-point calculation speeds by processing vectors in SIMD-register-sized chunks.
+- **FP32 / Binary SIMD (`DistanceKernels`)**: Automatically dispatches AVX-512, AVX2/FMA, or `Vector128` for `DotProduct`, `CosineDistance`, `L2DistanceSquared`, and `POPCNT`-unrolled `HammingDistance`.
+- **INT8 & Packed UINT4 (`DistanceKernels`)**: `DotInt8`, `SumInt8`, `DotInt8Quantized`, `DotFloatInt8`, `PackUInt4`, `DotUInt4Packed`, `SumUInt4Packed`, and `DotUInt4PackedQuantized` execute via AVX-512BW, AVX2 (`vpmaddubsw` + `vpmaddwd`), or portable 32-bit SWAR fallbacks.
+- **RaBitQ 1-Bit Hadamard Rotation (`HadamardProjection`)**: `ApplyFwhtInPlace`, `ApplyRandomRotation`, `RotateAndBinarize`, `EstimateCosineFromHamming`, and `EstimateAsymmetricCosine` spread coordinate outliers orthogonally before 1-bit sign packing (`32x` memory reduction).
+- **NVIDIA Split-K & `dp4a` GPU Scans (`GpuVectorAccelerator`)**: `ScanChunkGpu` automatically selects warp-cooperative Split-K FP32 for `dimensions >= 128` when DB chunks are cached in VRAM; `ScanChunkInt8Gpu` runs zero-`I2F` `dp4a.s32.s32` INT8 scans with multi-threaded SIMD CPU fallback.
 
 ---
 

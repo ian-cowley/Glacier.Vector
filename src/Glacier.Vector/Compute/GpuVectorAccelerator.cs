@@ -23,6 +23,8 @@ public static unsafe class GpuVectorAccelerator
     private static IntPtr s_cuContext;
     private static IntPtr s_cuModule;
     private static IntPtr s_fnDotScan;
+    private static IntPtr s_fnDotScanSplitK;
+    private static IntPtr s_fnDotScanInt8Dp4a;
     private static IntPtr s_fnBatchDotScan;
     private static IntPtr s_fnL2Scan;
 
@@ -93,6 +95,8 @@ public static unsafe class GpuVectorAccelerator
                 }
 
                 if (CuDriver.ModuleGetFunction(out s_fnDotScan, s_cuModule, "vector_dot_scan_fp32") != 0 ||
+                    CuDriver.ModuleGetFunction(out s_fnDotScanSplitK, s_cuModule, "vector_dot_scan_splitk_fp32") != 0 ||
+                    CuDriver.ModuleGetFunction(out s_fnDotScanInt8Dp4a, s_cuModule, "vector_dot_scan_int8_dp4a") != 0 ||
                     CuDriver.ModuleGetFunction(out s_fnBatchDotScan, s_cuModule, "vector_batch_dot_scan_fp32") != 0 ||
                     CuDriver.ModuleGetFunction(out s_fnL2Scan, s_cuModule, "vector_l2_scan_fp32") != 0)
                 {
@@ -269,9 +273,12 @@ public static unsafe class GpuVectorAccelerator
                 kernelParams[3] = &vecCount;
                 kernelParams[4] = &dims;
 
-                IntPtr fn = isL2Distance ? s_fnL2Scan : s_fnDotScan;
+                bool useSplitK = !isL2Distance && dimensions >= 128 && s_fnDotScanSplitK != IntPtr.Zero;
+                IntPtr fn = isL2Distance ? s_fnL2Scan : (useSplitK ? s_fnDotScanSplitK : s_fnDotScan);
                 uint blockSize = 256;
-                uint gridSize = (uint)((vectorCount + 255) / 256);
+                uint gridSize = useSplitK
+                    ? (uint)((vectorCount + 7) / 8)
+                    : (uint)((vectorCount + 255) / 256);
 
                 int launchRes = CuDriver.LaunchKernel(
                     fn,
@@ -295,6 +302,163 @@ public static unsafe class GpuVectorAccelerator
         s_cachedChunkIndex = -1;
         s_cachedStorageVersion = -1;
         s_lastUploadedDbBytes = 0;
+    }
+
+    /// <summary>
+    /// Executes a zero-I2F contiguous warp Split-K INT8 quantized similarity scan (<c>dp4a.s32.s32</c>) on NVIDIA GPU,
+    /// with multi-threaded AVX-512BW / AVX2 / SWAR CPU fallback.
+    /// </summary>
+    public static bool ScanChunkInt8Gpu(
+        ReadOnlySpan<sbyte> query,
+        float queryScale,
+        ReadOnlySpan<sbyte> chunkVectors,
+        float dbScale,
+        Span<float> scores,
+        int vectorCount,
+        int dimensions,
+        GpuTarget target = GpuTarget.Auto)
+    {
+        if (vectorCount <= 0 || dimensions <= 0) return false;
+        if (query.Length < dimensions ||
+            chunkVectors.Length < (long)vectorCount * dimensions ||
+            scores.Length < vectorCount)
+        {
+            return false;
+        }
+
+        bool canUseDp4a = (dimensions & 3) == 0;
+        switch (target)
+        {
+            case GpuTarget.Nvidia:
+                return canUseDp4a && ExecuteNvidiaInt8Scan(query, queryScale, chunkVectors, dbScale, scores, vectorCount, dimensions);
+
+            case GpuTarget.Amd:
+                return false;
+
+            case GpuTarget.Auto:
+                if (canUseDp4a && vectorCount >= 2_000 && IsNvidiaAvailable &&
+                    ExecuteNvidiaInt8Scan(query, queryScale, chunkVectors, dbScale, scores, vectorCount, dimensions))
+                {
+                    return true;
+                }
+                break;
+
+            case GpuTarget.Cpu:
+                break;
+        }
+
+        ExecuteCpuInt8Scan(query, queryScale, chunkVectors, dbScale, scores, vectorCount, dimensions);
+        return target == GpuTarget.Cpu || target == GpuTarget.Auto;
+    }
+
+    private static bool ExecuteNvidiaInt8Scan(
+        ReadOnlySpan<sbyte> query,
+        float queryScale,
+        ReadOnlySpan<sbyte> chunkVectors,
+        float dbScale,
+        Span<float> scores,
+        int vectorCount,
+        int dimensions)
+    {
+        if (!EnsureNvidiaInitialized() || s_fnDotScanInt8Dp4a == IntPtr.Zero) return false;
+
+        nuint bytesQuery = (nuint)dimensions;
+        nuint bytesDb = (nuint)((long)vectorCount * dimensions);
+        nuint bytesScores = (nuint)(vectorCount * sizeof(float));
+
+        lock (s_initLock)
+        {
+            CuDriver.CtxSetCurrent(s_cuContext);
+
+            if (bytesQuery > s_capQuery)
+            {
+                if (s_dQuery != IntPtr.Zero) CuDriver.MemFree(s_dQuery);
+                if (CuDriver.MemAlloc(out s_dQuery, bytesQuery) != 0) { s_capQuery = 0; return false; }
+                s_capQuery = bytesQuery;
+            }
+            if (bytesDb > s_capDatabase)
+            {
+                if (s_dDatabase != IntPtr.Zero) CuDriver.MemFree(s_dDatabase);
+                if (CuDriver.MemAlloc(out s_dDatabase, bytesDb) != 0) { s_capDatabase = 0; InvalidateDbCache(); return false; }
+                s_capDatabase = bytesDb;
+                InvalidateDbCache();
+            }
+            if (bytesScores > s_capScores)
+            {
+                if (s_dScores != IntPtr.Zero) CuDriver.MemFree(s_dScores);
+                if (CuDriver.MemAlloc(out s_dScores, bytesScores) != 0) { s_capScores = 0; return false; }
+                s_capScores = bytesScores;
+            }
+
+            InvalidateDbCache();
+
+            fixed (sbyte* pQuery = query)
+            fixed (sbyte* pDb = chunkVectors)
+            fixed (float* pScores = scores)
+            {
+                if (CuDriver.MemcpyHtoD(s_dQuery, (IntPtr)pQuery, bytesQuery) != 0) return false;
+                if (CuDriver.MemcpyHtoD(s_dDatabase, (IntPtr)pDb, bytesDb) != 0) return false;
+
+                IntPtr dQuery = s_dQuery;
+                IntPtr dDatabase = s_dDatabase;
+                IntPtr dScores = s_dScores;
+                int vecCount = vectorCount;
+                int dimsDiv4 = dimensions >> 2;
+                float combinedScale = queryScale * dbScale;
+
+                void** kernelParams = stackalloc void*[6];
+                kernelParams[0] = &dQuery;
+                kernelParams[1] = &dDatabase;
+                kernelParams[2] = &dScores;
+                kernelParams[3] = &vecCount;
+                kernelParams[4] = &dimsDiv4;
+                kernelParams[5] = &combinedScale;
+
+                uint blockSize = 256; // 8 warps per CTA
+                uint gridSize = (uint)((vectorCount + 7) / 8);
+
+                int launchRes = CuDriver.LaunchKernel(
+                    s_fnDotScanInt8Dp4a,
+                    gridSize, 1, 1,
+                    blockSize, 1, 1,
+                    0, IntPtr.Zero,
+                    (IntPtr)kernelParams,
+                    IntPtr.Zero);
+
+                if (launchRes != 0) return false;
+
+                CuDriver.StreamSynchronize(IntPtr.Zero);
+                return CuDriver.MemcpyDtoH((IntPtr)pScores, s_dScores, bytesScores) == 0;
+            }
+        }
+    }
+
+    private static void ExecuteCpuInt8Scan(
+        ReadOnlySpan<sbyte> query,
+        float queryScale,
+        ReadOnlySpan<sbyte> chunkVectors,
+        float dbScale,
+        Span<float> scores,
+        int vectorCount,
+        int dimensions)
+    {
+        fixed (sbyte* pQ = query)
+        fixed (sbyte* pDb = chunkVectors)
+        fixed (float* pScores = scores)
+        {
+            sbyte* qPtr = pQ;
+            sbyte* dbPtr = pDb;
+            float* sPtr = pScores;
+            float combined = queryScale * dbScale;
+
+            int parallelism = VectorConcurrency.GetEffectiveParallelism();
+            Parallel.For(0, vectorCount, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, i =>
+            {
+                var qSpan = new ReadOnlySpan<sbyte>(qPtr, dimensions);
+                var vSpan = new ReadOnlySpan<sbyte>(dbPtr + (long)i * dimensions, dimensions);
+                sPtr[i] = DistanceKernels.DotInt8(qSpan, vSpan) * combined;
+            });
+        }
     }
 
     #endregion
