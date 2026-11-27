@@ -257,18 +257,28 @@ public sealed class HnswVectorIndex : IDisposable
         if (query.Length != Dimensions)
             throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
-        if (_enterNodeId == -1 || topK <= 0) return Array.Empty<SearchResult>();
+        if (topK <= 0) return Array.Empty<SearchResult>();
 
-        int count = Math.Min(topK, _storage.Count);
-        if (count <= 0) return Array.Empty<SearchResult>();
-
-        var results = new SearchResult[count];
-        int written = Search(query, results.AsSpan(), efSearch);
-        if (written < count)
+        _rwLock.EnterReadLock();
+        try
         {
-            Array.Resize(ref results, written);
+            if (_enterNodeId == -1) return Array.Empty<SearchResult>();
+
+            int count = Math.Min(topK, _storage.Count);
+            if (count <= 0) return Array.Empty<SearchResult>();
+
+            var results = new SearchResult[count];
+            int written = Search(query, results.AsSpan(), efSearch);
+            if (written < count)
+            {
+                Array.Resize(ref results, written);
+            }
+            return results;
         }
-        return results;
+        finally
+        {
+            _rwLock.ExitReadLock();
+        }
     }
 
     private void SearchLayer(
@@ -342,13 +352,13 @@ public sealed class HnswVectorIndex : IDisposable
     {
         if (layer == 0)
         {
-            int offset = id * _m0;
+            int offset = checked((int)((long)id * _m0));
             return _layer0Edges.AsSpan(offset, _m0);
         }
         if (layer - 1 < _upperLayers.Count)
         {
             var layerArr = _upperLayers[layer - 1];
-            int offset = id * _m;
+            int offset = checked((int)((long)id * _m));
             if (offset + _m <= layerArr.Length)
                 return layerArr.AsSpan(offset, _m);
         }
@@ -359,17 +369,17 @@ public sealed class HnswVectorIndex : IDisposable
     {
         if (layer == 0)
         {
-            int offset = id * _m0;
+            int offset = checked((int)((long)id * _m0));
             return _layer0Edges.AsSpan(offset, _m0);
         }
         while (_upperLayers.Count < layer)
         {
-            var newL = new int[_nodeMaxLayers.Length * _m];
+            var newL = new int[checked((int)((long)_nodeMaxLayers.Length * _m))];
             Array.Fill(newL, -1);
             _upperLayers.Add(newL);
         }
         var arr = _upperLayers[layer - 1];
-        int upperOffset = id * _m;
+        int upperOffset = checked((int)((long)id * _m));
         return arr.AsSpan(upperOffset, _m);
     }
 
@@ -450,19 +460,21 @@ public sealed class HnswVectorIndex : IDisposable
     private void EnsureCapacity(int requiredCount)
     {
         if (requiredCount <= _nodeMaxLayers.Length) return;
-        int newCap = Math.Max(_nodeMaxLayers.Length * 2, requiredCount);
+        int oldNodeLen = _nodeMaxLayers.Length;
+        int newCap = Math.Max(oldNodeLen * 2, requiredCount);
 
         Array.Resize(ref _nodeMaxLayers, newCap);
+        _nodeMaxLayers.AsSpan(oldNodeLen).Fill(-1);
 
         int oldL0Len = _layer0Edges.Length;
-        Array.Resize(ref _layer0Edges, newCap * _m0);
+        Array.Resize(ref _layer0Edges, checked((int)((long)newCap * _m0)));
         _layer0Edges.AsSpan(oldL0Len).Fill(-1);
 
         for (int l = 0; l < _upperLayers.Count; l++)
         {
             var arr = _upperLayers[l];
             int oldLen = arr.Length;
-            Array.Resize(ref arr, newCap * _m);
+            Array.Resize(ref arr, checked((int)((long)newCap * _m)));
             arr.AsSpan(oldLen).Fill(-1);
             _upperLayers[l] = arr;
         }

@@ -163,4 +163,35 @@ public class HnswAndIvfPqTests : IDisposable
         Assert.Equal(250, storage.Count);
         Assert.True(storage.ChunkCount > 1);
     }
+
+    [Fact]
+    public void HnswAndIvfPq_GrowthPastInitialCapacity_AndUntrainedIvfPq_RemainAccurate()
+    {
+        const int dims = 16;
+        using var storage = new InMemoryVectorStorage(dims);
+        using var hnsw = new HnswVectorIndex(storage, m: 4, efConstruction: 32, initialCapacity: 4);
+
+        for (int i = 0; i < 40; i++)
+        {
+            float[] vec = new float[dims];
+            vec[i % dims] = 1.0f;
+            vec[(i + 1) % dims] = 0.1f * (i + 1);
+            hnsw.Add(vec, $"G_{i}");
+        }
+
+        float[] q = new float[dims];
+        q[0] = 1.0f;
+        var res = hnsw.Search(q, topK: 5, efSearch: 16);
+        Assert.Equal(5, res.Length);
+
+        using var ivf = new IvfPqIndex(dims, centroidCount: 8, subVectorCount: 2);
+        float[] a = new float[dims]; a[0] = 10f;
+        float[] b = new float[dims]; b[8] = -10f;
+        ivf.Add(a, "PositiveX");
+        ivf.Add(b, "NegativeY");
+
+        var ivfRes = ivf.Search(b, topK: 2, nprobe: 8);
+        Assert.Equal(2, ivfRes.Length);
+        Assert.Equal("NegativeY", ivfRes[0].Metadata);
+    }
 }

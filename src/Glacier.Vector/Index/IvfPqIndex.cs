@@ -234,9 +234,21 @@ public sealed class IvfPqIndex : IDisposable
 
     private void AutoInitUntrained(ReadOnlySpan<float> vector)
     {
+        // Perturb centroids deterministically so coarse Voronoi cells and PQ codes
+        // retain discrimination even if Add() is called before Train().
         for (int k = 0; k < CentroidCount; k++)
         {
-            vector.CopyTo(_coarseCentroids.AsSpan(k * Dimensions, Dimensions));
+            var dst = _coarseCentroids.AsSpan(k * Dimensions, Dimensions);
+            vector.CopyTo(dst);
+            if (k > 0)
+            {
+                uint h = (uint)k * 2654435761u;
+                int d1 = (int)(h % (uint)Dimensions);
+                int d2 = (int)(((h >> 8) ^ (uint)k) % (uint)Dimensions);
+                float delta = 0.05f * (1 + (k % 7)) * ((k & 1) == 0 ? 1f : -1f);
+                dst[d1] += delta;
+                dst[d2] -= delta * 0.5f;
+            }
         }
         for (int m = 0; m < SubVectorCount; m++)
         {
@@ -244,7 +256,15 @@ public sealed class IvfPqIndex : IDisposable
             int codebookOffset = m * 256 * SubVectorDim;
             for (int c = 0; c < 256; c++)
             {
-                sub.CopyTo(_pqCodebooks.AsSpan(codebookOffset + c * SubVectorDim, SubVectorDim));
+                var dst = _pqCodebooks.AsSpan(codebookOffset + c * SubVectorDim, SubVectorDim);
+                sub.CopyTo(dst);
+                if (c > 0)
+                {
+                    uint hc = ((uint)c * 2246822519u) ^ ((uint)m * 3266489917u);
+                    int d = (int)(hc % (uint)SubVectorDim);
+                    float delta = 0.02f * (((c + 1) / 2) * ((c & 1) == 0 ? 1f : -1f));
+                    dst[d] += delta;
+                }
             }
         }
         _isTrained = true;
