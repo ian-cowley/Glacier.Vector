@@ -20,7 +20,7 @@
 dotnet add package Glacier.Vector
 ```
 
-For stdio Model Context Protocol integration (`add_vector`, `search_vectors`, `ping`), see the [MCP Server Setup](mcp.md).
+For stdio Model Context Protocol integration (`McpServer` exposing `add_vector`, `search_vectors`, and `ping`), see the [MCP Server Setup](mcp.md).
 
 ---
 
@@ -58,6 +58,7 @@ SearchResult[] hits = index.Search(vec, topK: 5);
 - Call `index.Add(ReadOnlySpan<float> vector, string metadata)` safely from concurrent threads.
 - Pass `leaveStorageOpen: true` if multiple indexes share one `IVectorStorage` lifetime.
 - Dispose `VectorIndex` when done to release locks (and underlying storage when `leaveStorageOpen` is `false`).
+- Control thread-pool degree of parallelism via `Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism(int requested = 0)` (`0` resolves to `Environment.ProcessorCount`).
 
 ---
 
