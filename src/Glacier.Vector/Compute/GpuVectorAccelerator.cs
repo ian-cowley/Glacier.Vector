@@ -53,8 +53,18 @@ public static unsafe class GpuVectorAccelerator
     {
         AppDomain.CurrentDomain.ProcessExit += static (_, _) =>
         {
-            try { ReleaseGpuResources(); } catch { }
+            try { ReleaseGpuResources(); }
+            catch (Exception ex) { _ = ex; }
         };
+    }
+
+    private static void TryCudaCleanup(Action action, string operation)
+    {
+        try { action(); }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[GpuVectorAccelerator] CUDA {operation} cleanup failed: {ex.Message}");
+        }
     }
 
     private enum GpuDataKind : byte
@@ -214,12 +224,12 @@ public static unsafe class GpuVectorAccelerator
 
         if (s_cuModule != IntPtr.Zero)
         {
-            try { CuDriver.ModuleUnload(s_cuModule); } catch { }
+            TryCudaCleanup(() => CuDriver.ModuleUnload(s_cuModule), "ModuleUnload");
             s_cuModule = IntPtr.Zero;
         }
         if (s_cuContext != IntPtr.Zero)
         {
-            try { CuDriver.CtxDestroy(s_cuContext); } catch { }
+            TryCudaCleanup(() => CuDriver.CtxDestroy(s_cuContext), "CtxDestroy");
             s_cuContext = IntPtr.Zero;
         }
     }
@@ -245,7 +255,7 @@ public static unsafe class GpuVectorAccelerator
 
                     if (s_cuContext != IntPtr.Zero)
                     {
-                        try { CuDriver.CtxSetCurrent(s_cuContext); } catch { }
+                        TryCudaCleanup(() => CuDriver.CtxSetCurrent(s_cuContext), "CtxSetCurrent");
                     }
 
                     foreach (var slot in s_allSlots)
@@ -262,7 +272,8 @@ public static unsafe class GpuVectorAccelerator
                     {
                         if (entry.DevicePtr != IntPtr.Zero)
                         {
-                            try { CuDriver.MemFree(entry.DevicePtr); } catch { }
+                            var devicePtr = entry.DevicePtr;
+                            TryCudaCleanup(() => CuDriver.MemFree(devicePtr), "MemFree(vramCache)");
                             entry.DevicePtr = IntPtr.Zero;
                         }
                     }
@@ -285,16 +296,16 @@ public static unsafe class GpuVectorAccelerator
     {
         if (slot.Stream != IntPtr.Zero)
         {
-            try { CuDriver.StreamSynchronize(slot.Stream); } catch { }
-            try { CuDriver.StreamDestroy(slot.Stream); } catch { }
+            TryCudaCleanup(() => CuDriver.StreamSynchronize(slot.Stream), "StreamSynchronize");
+            TryCudaCleanup(() => CuDriver.StreamDestroy(slot.Stream), "StreamDestroy");
             slot.Stream = IntPtr.Zero;
         }
-        if (slot.DQuery != IntPtr.Zero) { try { CuDriver.MemFree(slot.DQuery); } catch { } slot.DQuery = IntPtr.Zero; slot.CapQuery = 0; }
-        if (slot.DScores != IntPtr.Zero) { try { CuDriver.MemFree(slot.DScores); } catch { } slot.DScores = IntPtr.Zero; slot.CapScores = 0; }
-        if (slot.DEphemeralDb != IntPtr.Zero) { try { CuDriver.MemFree(slot.DEphemeralDb); } catch { } slot.DEphemeralDb = IntPtr.Zero; slot.CapEphemeralDb = 0; }
-        if (slot.HQueryPinned != IntPtr.Zero) { try { CuDriver.MemFreeHost(slot.HQueryPinned); } catch { } slot.HQueryPinned = IntPtr.Zero; slot.CapHQueryPinned = 0; }
-        if (slot.HScoresPinned != IntPtr.Zero) { try { CuDriver.MemFreeHost(slot.HScoresPinned); } catch { } slot.HScoresPinned = IntPtr.Zero; slot.CapHScoresPinned = 0; }
-        if (slot.HStagingPinned != IntPtr.Zero) { try { CuDriver.MemFreeHost(slot.HStagingPinned); } catch { } slot.HStagingPinned = IntPtr.Zero; slot.CapHStagingPinned = 0; }
+        if (slot.DQuery != IntPtr.Zero) { TryCudaCleanup(() => CuDriver.MemFree(slot.DQuery), "MemFree(DQuery)"); slot.DQuery = IntPtr.Zero; slot.CapQuery = 0; }
+        if (slot.DScores != IntPtr.Zero) { TryCudaCleanup(() => CuDriver.MemFree(slot.DScores), "MemFree(DScores)"); slot.DScores = IntPtr.Zero; slot.CapScores = 0; }
+        if (slot.DEphemeralDb != IntPtr.Zero) { TryCudaCleanup(() => CuDriver.MemFree(slot.DEphemeralDb), "MemFree(DEphemeralDb)"); slot.DEphemeralDb = IntPtr.Zero; slot.CapEphemeralDb = 0; }
+        if (slot.HQueryPinned != IntPtr.Zero) { TryCudaCleanup(() => CuDriver.MemFreeHost(slot.HQueryPinned), "MemFreeHost(HQueryPinned)"); slot.HQueryPinned = IntPtr.Zero; slot.CapHQueryPinned = 0; }
+        if (slot.HScoresPinned != IntPtr.Zero) { TryCudaCleanup(() => CuDriver.MemFreeHost(slot.HScoresPinned), "MemFreeHost(HScoresPinned)"); slot.HScoresPinned = IntPtr.Zero; slot.CapHScoresPinned = 0; }
+        if (slot.HStagingPinned != IntPtr.Zero) { TryCudaCleanup(() => CuDriver.MemFreeHost(slot.HStagingPinned), "MemFreeHost(HStagingPinned)"); slot.HStagingPinned = IntPtr.Zero; slot.CapHStagingPinned = 0; }
     }
 
     private static CudaExecutionSlot? AcquireSlot()
@@ -521,7 +532,7 @@ public static unsafe class GpuVectorAccelerator
         if (!UploadDbViaStagingAsync(slot, newDPtr, hDbPtr, bytesDb) ||
             CuDriver.StreamSynchronize(slot.Stream) != 0)
         {
-            try { CuDriver.MemFree(newDPtr); } catch { }
+            TryCudaCleanup(() => CuDriver.MemFree(newDPtr), "MemFree(newDPtr)");
             return false;
         }
 
@@ -581,7 +592,7 @@ public static unsafe class GpuVectorAccelerator
 
         if (duplicateToFree != IntPtr.Zero)
         {
-            try { CuDriver.MemFree(duplicateToFree); } catch { }
+            TryCudaCleanup(() => CuDriver.MemFree(duplicateToFree), "MemFree(duplicateToFree)");
         }
         FreeDevicePointers(replacedToFree);
 
@@ -655,7 +666,7 @@ public static unsafe class GpuVectorAccelerator
         {
             if (ptr != IntPtr.Zero)
             {
-                try { CuDriver.MemFree(ptr); } catch { }
+                TryCudaCleanup(() => CuDriver.MemFree(ptr), "MemFree(evicted)");
             }
         }
     }
@@ -677,7 +688,7 @@ public static unsafe class GpuVectorAccelerator
 
         if (ptrToFree != IntPtr.Zero)
         {
-            try { CuDriver.MemFree(ptrToFree); } catch { }
+            TryCudaCleanup(() => CuDriver.MemFree(ptrToFree), "MemFree(ptrToFree)");
         }
     }
 

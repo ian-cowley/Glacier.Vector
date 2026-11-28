@@ -332,7 +332,11 @@ namespace Glacier.Vector.Storage
             catch
             {
                 ReleaseMappingHandles();
-                try { _fileStream?.Dispose(); } catch { }
+                try { _fileStream?.Dispose(); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Rollback stream Dispose failed: {ex.Message}");
+                }
                 _rwLock.Dispose();
                 throw;
             }
@@ -364,10 +368,15 @@ namespace Glacier.Vector.Storage
                 }
                 File.Move(tempPath, _metaPath, overwrite: true);
             }
-            catch
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or ObjectDisposedException)
             {
                 // Best-effort crash recovery sidecar
-                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Sidecar crash recovery failed: {ex.Message}");
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); }
+                catch (Exception deleteEx) when (deleteEx is System.IO.IOException or UnauthorizedAccessException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Sidecar temp delete failed '{tempPath}': {deleteEx.Message}");
+                }
             }
         }
 
@@ -375,13 +384,29 @@ namespace Glacier.Vector.Storage
         {
             if (_basePointer != IntPtr.Zero)
             {
-                try { _accessor?.Flush(); } catch { }
-                try { _accessor?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                try { _accessor?.Flush(); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Accessor Flush failed: {ex.Message}");
+                }
+                try { _accessor?.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Accessor ReleasePointer failed: {ex.Message}");
+                }
                 Volatile.Write(ref _basePointer, IntPtr.Zero);
             }
-            try { _accessor?.Dispose(); } catch { }
+            try { _accessor?.Dispose(); }
+            catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Accessor Dispose failed: {ex.Message}");
+            }
             _accessor = null;
-            try { _mmf?.Dispose(); } catch { }
+            try { _mmf?.Dispose(); }
+            catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[VectorStorage] MMF Dispose failed: {ex.Message}");
+            }
             _mmf = null;
         }
 
@@ -407,10 +432,22 @@ namespace Glacier.Vector.Storage
             {
                 if (pointerAcquired && accessor != null)
                 {
-                    try { accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                    try { accessor.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                    catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Remap ReleasePointer failed: {ex.Message}");
+                    }
                 }
-                try { accessor?.Dispose(); } catch { }
-                try { mmf?.Dispose(); } catch { }
+                try { accessor?.Dispose(); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Remap accessor Dispose failed: {ex.Message}");
+                }
+                try { mmf?.Dispose(); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Remap MMF Dispose failed: {ex.Message}");
+                }
                 throw;
             }
         }
@@ -583,8 +620,16 @@ namespace Glacier.Vector.Storage
                 ReleaseMappingHandles();
 
                 long exactBytes = _dataOffset + (long)_count * Dimensions * sizeof(float);
-                try { _fileStream?.SetLength(exactBytes); } catch { }
-                try { _fileStream?.Flush(flushToDisk: true); } catch { }
+                try { _fileStream?.SetLength(exactBytes); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException or NotSupportedException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Truncate SetLength failed: {ex.Message}");
+                }
+                try { _fileStream?.Flush(flushToDisk: true); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[VectorStorage] Shutdown Flush failed: {ex.Message}");
+                }
                 _fileStream?.Dispose();
 
                 if (_dataOffset == 0)

@@ -66,7 +66,8 @@ namespace Glacier.Vector.Mcp
         {
             if (_debugLog)
             {
-                try { Console.Error.WriteLine($"[Glacier.Vector.Mcp] {message}"); } catch { }
+                try { Console.Error.WriteLine($"[Glacier.Vector.Mcp] {message}"); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException) { _ = ex; }
             }
         }
 
@@ -172,7 +173,11 @@ namespace Glacier.Vector.Mcp
                     Log($"Protocol error: {ex.Message}");
                     if (requestId.ValueKind != JsonValueKind.Undefined && requestId.ValueKind != JsonValueKind.Null)
                     {
-                        try { await SendErrorAsync(requestId, -32603, "Internal server error.").ConfigureAwait(false); } catch { }
+                        try { await SendErrorAsync(requestId, -32603, "Internal server error.").ConfigureAwait(false); }
+                        catch (Exception sendEx) when (sendEx is System.IO.IOException or ObjectDisposedException or InvalidOperationException)
+                        {
+                            Log($"Failed to send error response: {sendEx.Message}");
+                        }
                     }
                 }
             }
@@ -354,7 +359,11 @@ namespace Glacier.Vector.Mcp
             _reader.Dispose();
             if (_ownsStreams)
             {
-                try { _outputStream.Dispose(); } catch { }
+                try { _outputStream.Dispose(); }
+                catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+                {
+                    Log($"Failed to dispose output stream: {ex.Message}");
+                }
             }
         }
     }
