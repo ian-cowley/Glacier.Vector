@@ -25,6 +25,7 @@ public static class Program
         RunDistanceKernelBenchmarks();
         RunQuantizedAndHadamardBenchmarks();
         RunHnswSearchBenchmarks();
+        RunStorageAndIvfPqBenchmarks();
 
         Console.WriteLine("================================================================================");
         Console.WriteLine("          ALL MICROBENCHMARKS COMPLETED SUCCESSFULLY                            ");
@@ -299,6 +300,81 @@ public static class Program
                 double gpuI8Ms = swGpuI8.Elapsed.TotalMilliseconds / trials;
                 Console.WriteLine($"    Dim {dim,4} NVIDIA GPU: SplitK-FP32(cached)={gpuFp32Ms:F2} ms ({vecCount / gpuFp32Ms / 1000.0:F1} M vec/s) | INT8-dp4a(incl. H2D)={gpuI8Ms:F2} ms ({vecCount / gpuI8Ms / 1000.0:F1} M vec/s)");
             }
+        }
+    }
+
+    private static void RunStorageAndIvfPqBenchmarks()
+    {
+        Console.WriteLine("\n[3] Storage Backends & IVF-PQ Index Search (2,000 vectors x 128D):");
+        const int dims = 128;
+        const int count = 2000;
+        var rand = new Random(77);
+        float[] flatData = new float[count * dims];
+        for (int i = 0; i < flatData.Length; i++) flatData[i] = (float)(rand.NextDouble() * 2.0 - 1.0);
+        float[] query = new float[dims];
+        Array.Copy(flatData, query, dims);
+
+        string tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"vec_bench_{Guid.NewGuid():N}");
+        System.IO.Directory.CreateDirectory(tempDir);
+        try
+        {
+            string mmfPath = System.IO.Path.Combine(tempDir, "mmf.vec");
+            string pagedPath = System.IO.Path.Combine(tempDir, "paged.vec");
+
+            void MeasureStorage(string label, IVectorStorage storage, int queries)
+            {
+                var swAdd = Stopwatch.StartNew();
+                for (int i = 0; i < count; i++) storage.Append(flatData.AsSpan(i * dims, dims));
+                swAdd.Stop();
+
+                using var idx = new VectorIndex(storage, leaveStorageOpen: true);
+                for (int w = 0; w < 20; w++) _ = idx.Search(query, 10);
+                var swSearch = Stopwatch.StartNew();
+                for (int q = 0; q < queries; q++) _ = idx.Search(query, 10);
+                swSearch.Stop();
+
+                double qps = queries / swSearch.Elapsed.TotalSeconds;
+                double usPerQuery = swSearch.Elapsed.TotalMicroseconds / queries;
+                Console.WriteLine($"    {label,-20}: Ingest={swAdd.Elapsed.TotalMilliseconds:F2} ms | Search={usPerQuery:F1} µs/q ({qps:N0} QPS)");
+            }
+
+            using (var mem = new InMemoryVectorStorage(dims)) MeasureStorage("InMemoryVectorStorage", mem, 1000);
+            using (var mmf = new MmfVectorStorage(mmfPath, dims)) MeasureStorage("MmfVectorStorage", mmf, 1000);
+            using (var paged = new PagedVectorStorage(pagedPath, dims, maxMemoryBytes: 256 * 1024)) MeasureStorage("PagedVectorStorage", paged, 200);
+
+            using var bin = new BinaryVectorStorage(dims, count);
+            var swBinAdd = Stopwatch.StartNew();
+            for (int i = 0; i < count; i++) bin.Append(flatData.AsSpan(i * dims, dims));
+            swBinAdd.Stop();
+            ulong[] qBin = new ulong[bin.WordsPerVector];
+            DistanceKernels.PackBinaryVector(query, qBin);
+            int popSum = 0;
+            var swBinScan = Stopwatch.StartNew();
+            for (int q = 0; q < 1000; q++)
+            {
+                for (int i = 0; i < count; i++)
+                    popSum += DistanceKernels.HammingDistance(qBin, bin.GetPackedVector(i));
+            }
+            swBinScan.Stop();
+            GC.KeepAlive(popSum);
+            Console.WriteLine($"    {"BinaryVectorStorage",-20}: Ingest={swBinAdd.Elapsed.TotalMilliseconds:F2} ms | Scan={swBinScan.Elapsed.TotalMicroseconds / 1000.0:F1} µs/q ({1000.0 / swBinScan.Elapsed.TotalSeconds:N0} QPS)");
+
+            using var ivf = new IvfPqIndex(dims, centroidCount: 32);
+            var swTrain = Stopwatch.StartNew();
+            ivf.Train(flatData, count, iterations: 5);
+            swTrain.Stop();
+            var swIvfAdd = Stopwatch.StartNew();
+            for (int i = 0; i < count; i++) ivf.Add(flatData.AsSpan(i * dims, dims), $"doc_{i}");
+            swIvfAdd.Stop();
+            for (int w = 0; w < 20; w++) _ = ivf.Search(query, topK: 10, nprobe: 8);
+            var swIvfSearch = Stopwatch.StartNew();
+            for (int q = 0; q < 1000; q++) _ = ivf.Search(query, topK: 10, nprobe: 8);
+            swIvfSearch.Stop();
+            Console.WriteLine($"    {"IvfPqIndex (K=32)",-20}: Train={swTrain.Elapsed.TotalMilliseconds:F1} ms | Add={swIvfAdd.Elapsed.TotalMilliseconds:F1} ms | Search={swIvfSearch.Elapsed.TotalMicroseconds / 1000.0:F1} µs/q ({1000.0 / swIvfSearch.Elapsed.TotalSeconds:N0} QPS)");
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(tempDir, recursive: true); } catch { }
         }
     }
 

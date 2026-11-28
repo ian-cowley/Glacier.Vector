@@ -7,247 +7,100 @@
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Vector.svg)](https://www.nuget.org/packages/Glacier.Vector/)
 [![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Vector.svg)](https://www.nuget.org/packages/Glacier.Vector/)
-[![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
-[![DEV.to Story](https://img.shields.io/badge/DEV.to-Story-0a0a0a?style=for-the-badge&logo=devto&logoColor=white)](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a)
-[![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
-> 📖 **Read the Deep-Dive**: **[I built a zero-dependency C# vector database that saturates DDR5 RAM bandwidth.](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a)**
+`Glacier.Vector` is a pure C#, Native AOT-compatible (`IsAotCompatible=true`) vector search engine and quantization library for .NET 10. It provides AVX-512 / AVX2 / `Vector128` SIMD distance kernels, HNSW and IVF-PQ indexes, Hadamard/RaBitQ 1-bit rotation, pluggable RAM and disk-backed storages (`InMemoryVectorStorage`, `MmfVectorStorage`, `PagedVectorStorage`, `BinaryVectorStorage`), optional NVIDIA CUDA driver P/Invoke (`nvcuda.dll`), and an embedded MCP server (`Glacier.Vector.Host`).
 
-```text
-========================================================================================================
-  GLACIER.VECTOR BARE-METAL GPU THROUGHPUT BENCHMARK (NVIDIA RTX 4060 vs PYTHON FAISS)
-========================================================================================================
-  Python FAISS (CPU Brute Force)     :  ~120 ms
-  Glacier.Vector (Bare-Metal GPU)    :  2.57 ms (622,700,000 vectors/sec)
---------------------------------------------------------------------------------------------------------
-  🏆 SPEEDUP                         :  46x FASTER THAN PYTHON FAISS / 10.1x FASTER THAN AVX-512
-  ⚡ HARDWARE ARCHITECTURE           :  Pure C# Direct P/Invoke (Zero CUDA Toolkit / Zero C++ DLLs)
-========================================================================================================
-```
+Read the background write-up: [I built a zero-dependency C# vector database that saturates DDR5 RAM bandwidth](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a).
 
-**Glacier.Vector** is a high-performance, SIMD-accelerated vector search engine and index for .NET 10. Built for speed and efficiency, it provides a zero-copy architecture for storing and querying high-dimensional embeddings, commonly used in LLM-powered applications and semantic search.
-
----
-
-## Key Features
-
-*   🚀 **SIMD-Accelerated Search**: Utilizes hardware intrinsics (AVX2, AVX-512) for lightning-fast brute-force vector comparisons (Cosine Similarity, Dot Product, Euclidean Distance).
-*   ⚡ **Bare-Metal GPU Batch & Quantized Scan**: Direct driver P/Invoke (`nvcuda.dll` / `libcuda.so.1`) offloading 2D batch scans, Split-K FP32 (`dimensions >= 128`), and zero-`I2F` `dp4a.s32.s32` INT8 scans (`ScanChunkInt8Gpu`) to NVIDIA GPUs with multi-core SIMD fallback.
-*   🌀 **Hadamard & RaBitQ 1-Bit Compression (`HadamardProjection`)**: AVX-512F / AVX2 normalized FWHT random rotation (`ApplyFwhtInPlace`, `RotateAndBinarize`) packing 32&times; compressed 1-bit codes with asymmetric dot/cosine estimation.
-*   🔢 **Sub-Byte Quantized Distance Kernels (`DistanceKernels`)**: AVX-512BW / AVX2 / 32-bit SWAR `DotInt8`, `SumInt8`, `DotInt8Quantized`, `DotUInt4Packed`, `SumUInt4Packed`, and `DotUInt4PackedQuantized`.
-*   💾 **Persistent Device VRAM Caching**: Keeps database vectors resident in GPU memory across queries, bypassing host-to-device PCIe transfer penalties.
-*   📈 **Over 622 Million Vectors/sec**: Delivers 10.1x sustained speedup over multi-core AVX-512 CPU execution for large batch queries.
-*   🧠 **LLM Optimized**: Specifically designed to handle standard embedding dimensions (e.g., 1536 for OpenAI `text-embedding-3-small` or 768 for nomic-embed).
-*   📥 **Zero-Copy Memory Model**: Efficiently manages large vector datasets in-memory using `Span<T>` and `Memory<T>`, minimizing allocations and GC pressure.
-*   🤖 **MCP Server Support**: Built-in support for the Model Context Protocol, allowing seamless integration with AI agents and tools.
-*   🛠️ **Extensible Storage**: Pluggable storage backends, starting with high-performance `InMemoryVectorStorage`.
-
----
-
-## 📊 Performance Benchmarks
-
-*Benchmarked on .NET 10.0: AMD Ryzen AI 9 HX 370 (Zen 5 AVX-512) vs. NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace sm_89)*
-
-| Operation | Workload Dataset | FAISS (Python/CPU) | Glacier.Vector (CPU SIMD) | Glacier.Vector (Bare-Metal GPU) | Search Throughput | Speedup |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Batch Dot-Product Scan** | 50,000 vectors × 128 dims ($B=32$) | ~120 ms | 26.0 ms | **2.57 ms** | **622.7 M vec/s** | **10.1x** |
-| **Single Vector Scan** | 100,000 vectors × 128 dims | ~18 ms | 4.8 ms | **0.85 ms** | **117.6 M vec/s** | **5.6x** |
-| **L2 Euclidean Distance Scan**| 50,000 vectors × 128 dims ($B=32$) | ~145 ms | 31.2 ms | **3.10 ms** | **516.1 M vec/s** | **10.0x** |
-| **LLM 1536-Dim Batch Scan** | 100,000 vectors × 1536 dims ($B=64$) | ~1,850 ms | 388 ms | **566.2 ms (8.85 ms/q)** | **11.3 M vec/s** | **3.3x** |
-| **LLM 1536-Dim Single Scan** | 100,000 vectors × 1536 dims | ~32 ms | 8.77 ms | **7.81 ms** | **12.8 M vec/s** | **4.1x** |
-
-### Empirical Quantized, Hadamard & Split-K Scan Benchmarks (Nov 2026)
-
-Measured via `dotnet run --project benchmarks/Glacier.Vector.Benchmarks/Glacier.Vector.Benchmarks.csproj -c Release`:
-
-| Kernel / Path | Workload | Measured Latency | Throughput |
-| :--- | :--- | :---: | :---: |
-| **CPU SIMD `DotProduct` vs `DotInt8` vs `DotUInt4Packed`** | Single pair, `Dim = 1536` | **61.9 ns** / **24.2 ns** / **4.8 ns** | **16.2 / 41.3 / 210.0 MOps/s** (`DotUInt4Packed` 13.0&times; faster than FP32) |
-| **CPU SIMD `DotProduct` vs `DotInt8` vs `DotUInt4Packed`** | Single pair, `Dim = 768` | **32.4 ns** / **12.1 ns** / **3.0 ns** | **30.9 / 82.9 / 336.2 MOps/s** |
-| **`HadamardProjection.ApplyFwhtInPlace` / `RotateAndBinarize`** | `Dim = 128` (`pad 128`) | **0.03 &mu;s** / **0.10 &mu;s** | **29.79M / 9.58M vec/s** |
-| **`HadamardProjection.ApplyFwhtInPlace` / `RotateAndBinarize`** | `Dim = 1536` (`pad 2048`) | **0.63 &mu;s** / **1.17 &mu;s** | **1.58M / 851.9 kVec/s** |
-| **Chunk Scan: `Dim = 128`, 100,000 vectors** | CPU FP32 / CPU INT8 / GPU Split-K FP32 (cached) / GPU `dp4a` INT8 (incl. H2D) | **0.96 / 0.35 / 0.49 / 1.19 ms** | **103.8 / 286.8 / 202.2 / 84.2 M vec/s** |
-| **Chunk Scan: `Dim = 1536`, 100,000 vectors** | CPU FP32 / CPU INT8 / GPU Split-K FP32 (cached) / GPU `dp4a` INT8 (incl. H2D) | **7.84 / 2.58 / 5.04 / 12.57 ms** | **12.8 / 38.7 / 19.8 / 8.0 M vec/s** |
-| **HNSW Index Search (`10,000` queries, `2k x 128D`)** | Allocating vs Zero-Alloc `Span<SearchResult>` | **35.1 &mu;s** vs **23.7 &mu;s** | **28,454 QPS** (184 B/q) vs **42,109 QPS** (**0 B/q**) |
-
-Note: `ScanChunkInt8Gpu` invalidates the cached DB buffer per call and pays the host-to-device PCIe copy (`12.8 MB` at `128D`, `153.6 MB` at `1536D`), making multi-core CPU SIMD INT8 (`0.35 ms` / `2.58 ms`) faster on uncached single scans, whereas cached VRAM `Split-K FP32` (`0.49 ms` / `5.04 ms`) beats CPU FP32 (`0.96 ms` / `7.84 ms`) by `1.56x–1.96x`.
-
----
-
-## Installation
-
-Glacier.Vector is available as a [NuGet package](https://www.nuget.org/packages/Glacier.Vector). Install it using the .NET CLI:
+## Install
 
 ```bash
 dotnet add package Glacier.Vector
 ```
 
----
-
 ## Quick Start
 
-### 1. Initialize Index and Storage
+### In-Memory Index & Search
 
 ```csharp
 using Glacier.Vector.Index;
 using Glacier.Vector.Storage;
 
-// Initialize storage for 1536-dimensional vectors
 using var storage = new InMemoryVectorStorage(dimensions: 1536);
 using var index = new VectorIndex(storage);
-```
 
-### 2. Add Vectors
+float[] docVector = new float[1536];
+docVector[0] = 1.0f;
+index.Add(docVector, metadata: "Greeting message");
 
-```csharp
-float[] vector = GetEmbeddings("Hello, world!");
-index.Add(vector, metadata: "Greeting message");
-```
+float[] query = new float[1536];
+query[0] = 1.0f;
+SearchResult[] hits = index.Search(query, topK: 5);
 
-### 3. Search
-
-```csharp
-float[] query = GetEmbeddings("Hi there");
-var results = index.Search(query, topK: 5);
-
-foreach (var hit in results)
+foreach (SearchResult hit in hits)
 {
-    Console.WriteLine($"ID: {hit.Id}, Score: {hit.Score:F4}, Metadata: {hit.Metadata}");
+    Console.WriteLine($"ID={hit.Id}, Score={hit.Score:F4}, Metadata={hit.Metadata}");
 }
 ```
 
-### 4. Bare-Metal GPU Batch Vector Scan
+### Zero-Allocation HNSW Search & Batch GPU Scan
+
 ```csharp
 using Glacier.Vector.Compute;
 using Glacier.Vector.Core;
+using Glacier.Vector.Index;
+using Glacier.Vector.Storage;
 
-// High-throughput 2D grid GPU batch search: computes Database * Queries^T
-float[] db = LoadDatabaseVectors(count: 50_000, dim: 128);
-float[] queries = LoadBatchQueries(batchSize: 32, dim: 128);
+using var storage = new InMemoryVectorStorage(dimensions: 128);
+using var hnsw = new HnswVectorIndex(storage, m: 16, efConstruction: 64);
+
+Span<SearchResult> topK = stackalloc SearchResult[10];
+float[] query = new float[128];
+int found = hnsw.Search(query, topK, efSearch: 64);
+
+// Optional 2D batch scan on NVIDIA CUDA (falls back automatically when unavailable)
+float[] db = new float[50_000 * 128];
+float[] queries = new float[32 * 128];
 float[] scores = new float[50_000 * 32];
-
-// Executes on NVIDIA RTX 4060 dGPU or AMD APU with persistent VRAM caching
-GpuVectorAccelerator.BatchScanGpu(
-    db, queries, scores, 
-    vectorCount: 50_000, dimensions: 128, batchSize: 32, 
-    target: GpuTarget.Auto
-);
+GpuVectorAccelerator.BatchScanGpu(db, queries, scores, vectorCount: 50_000, dimensions: 128, batchSize: 32, target: GpuTarget.Auto);
 ```
 
----
+## Key Capabilities
 
-## MCP Server Setup
+- **SIMD Distance & Quantized Kernels (`DistanceKernels`):** Dispatches AVX-512, AVX2/FMA (`vpmaddubsw` / `vpmaddwd`), and 32-bit SWAR fallbacks across FP32 (`DotProduct`, `CosineDistance`, `L2Distance`, `L2DistanceSquared`), binary `HammingDistance`, INT8 (`DotInt8`, `DotInt8Quantized`, `DotFloatInt8`), and packed UINT4 (`PackUInt4`, `DotUInt4Packed`, `DotUInt4PackedQuantized`).
+- **Hadamard / RaBitQ 1-Bit Compression (`HadamardProjection`):** Applies orthogonal FWHT rotation before 1-bit binarization (`RotateAndBinarize`) with asymmetric cosine/inner-product estimators.
+- **Indexes & Storage Backends:** Exact parallel `VectorIndex`, zero-alloc `HnswVectorIndex`, 32x-compressed `IvfPqIndex`, `InMemoryVectorStorage`, memory-mapped `MmfVectorStorage`, LRU-bounded `PagedVectorStorage`, and 1-bit `BinaryVectorStorage`.
+- **VRAM-Cached CUDA vs. CPU Tradeoff:** Cached VRAM Split-K FP32 (`ScanChunkGpu`) outperforms CPU SIMD FP32 when vector chunks stay resident in GPU memory. On single-shot uncached INT8 scans (`ScanChunkInt8Gpu`), host-to-device PCIe copy makes multi-core CPU SIMD INT8 faster.
 
-Glacier.Vector includes a built-in MCP (Model Context Protocol) server host, allowing you to use your vector database as a tool for AI agents (like Claude or Antigravity).
+## Measured Benchmarks
 
-### 1. Build the Server
-First, build the host application in Release mode:
+Measured in Release on **AMD Ryzen AI 9 HX 370 (12C/24T Zen 5, AVX-512) + NVIDIA GeForce RTX 4060 Laptop GPU (8 GB), 31 GB RAM, Windows 11, .NET 10.0.15 (.NET SDK 11.0.100)**:
+
+| Workload | Scope | Measured Result | Notes |
+| :--- | :--- | ---: | :--- |
+| `DistanceKernels` (`Dim=1536`, FP32 / INT8 / UINT4) | Single pair | **63.7 ns** / **24.9 ns** / **4.9 ns** | 15.7 / 40.1 / **206.1 MOps/s** |
+| `HadamardProjection.RotateAndBinarize` | `Dim=1536` (`pad 2048`) | **0.97 us** | 1,028.8 kVec/s |
+| Chunk Scan (`Dim=128`, 100k vecs) | CPU FP32 / CPU INT8 / GPU SplitK (cached) | **1.02 ms** / **0.35 ms** / **0.39 ms** | GPU INT8 `dp4a` incl. H2D: **1.55 ms** |
+| Chunk Scan (`Dim=1536`, 100k vecs) | CPU FP32 / CPU INT8 / GPU SplitK (cached) | **7.92 ms** / **2.27 ms** / **2.96 ms** | GPU INT8 `dp4a` incl. H2D: **17.77 ms** |
+| `HnswVectorIndex.Search` (Alloc vs Zero-Alloc) | 10k queries (`2k x 128D`) | **35.5 us** (184 B/q) vs **23.8 us** (**0 B/q**) | **28,136** vs **42,015 QPS** |
+| `IvfPqIndex.Search` (`K=32`, `nprobe=8`) | `2k x 128D` | **23.8 us/q** | **42,069 QPS** |
+
+Reproduce locally:
 
 ```bash
-dotnet build src/Glacier.Vector.Host/Glacier.Vector.Host.csproj -c Release
+dotnet run --project benchmarks/Glacier.Vector.Benchmarks/Glacier.Vector.Benchmarks.csproj -c Release
 ```
 
-### 2. Configure Your Client
-Add the following entry to your `mcp_config.json` (usually located in `%AppData%\Roaming\Claude\claude_desktop_config.json` or your agent's config directory):
+## Documentation
 
-```json
-{
-  "mcpServers": {
-    "glacier-vector": {
-      "command": "dotnet",
-      "args": [
-        "ABS_PATH_TO_REPO/src/Glacier.Vector.Host/bin/Release/net10.0/Glacier.Vector.Host.dll"
-      ]
-    }
-  }
-}
-```
+- [Usage Guide](docs/usage.md) — storage choices, IVF-PQ, quantized scans, Hadamard projection, and demo app
+- [Architecture](docs/architecture.md) — memory layout, SIMD dispatch, zero-alloc HNSW/IVF-PQ, and CUDA VRAM caching
+- [Benchmarks](docs/benchmarks.md) — complete kernel, scan, HNSW, IVF-PQ, and storage backend measurements
+- [MCP Server Setup](docs/mcp.md) — building and configuring `Glacier.Vector.Host` for MCP clients
+- [Changelog](CHANGELOG.md) — release notes
 
-### 3. Available Tools
+## License & Credits
 
-- **`add_vector`**: Adds a 1536-dimensional vector and associated metadata to the index.
-- **`search_vectors`**: Performs a semantic search for the closest matches to a query vector.
-- **`ping`**: Simple health check to verify the server is responding.
+Licensed under the [MIT License](LICENSE).
 
-The server defaults to 1536 dimensions, optimized for modern LLM embedding models.
-
----
-
-## Performance
-
-Glacier.Vector is designed to saturate your CPU's memory bandwidth during search operations. On modern hardware, it can scan millions of vectors per second using SIMD-optimized kernels.
-
-| Operation | Performance |
-| :--- | :--- |
-| **Vector Scan** | ~100M+ dimensions/sec (per core) |
-| **Index Load** | Near-instant (In-Memory) |
-| **Memory Overhead** | ~4 bytes per dimension (float32) |
-
----
-
-## Architecture
-
-1.  **Compute Kernels**: Static, SIMD-optimized methods for distance calculations.
-2.  **Vector Storage**: Manages the raw memory layouts of vectors and metadata.
-3.  **Vector Index**: Coordinates search operations and manages IDs/metadata mappings.
-4.  **MCP Integration**: Exposes the vector search capabilities via a standard Model Context Protocol interface.
-
----
-
-## Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
-## 🆕 What's New in v1.3.0
-
-- **Hadamard & RaBitQ 1-Bit Compression (`HadamardProjection`)** — AVX-512F / AVX2 normalized FWHT random rotation (`ApplyFwhtInPlace`, `ApplyRandomRotation`, `RotateAndBinarize`) packing 32&times; compressed 1-bit codes with asymmetric inner-product/cosine estimation (`EstimateCosineFromHamming`, `EstimateAsymmetricCosine`).
-- **INT8 & Packed UINT4 Kernels (`DistanceKernels`)** — AVX-512BW / AVX2 (`vpmaddubsw` + `vpmaddwd`) / portable 32-bit SWAR kernels (`DotInt8`, `SumInt8`, `DotInt8Quantized`, `DotFloatInt8`, `PackUInt4`, `DotUInt4Packed`, `SumUInt4Packed`, `DotUInt4PackedQuantized`).
-- **GPU Split-K FP32 & Zero-`I2F` `dp4a` INT8 Scans (`GpuVectorAccelerator`)** — Warp-cooperative Split-K FP32 (`dimensions >= 128`) and `ScanChunkInt8Gpu` (`dp4a.s32.s32`) with multi-threaded SIMD CPU fallback.
-- **140 unit tests** passing (100% green).
-
----
-
-## 🆕 What's New in v1.1.0
-
-- **Native AOT & Strict Build Hygiene** — Full `<IsAotCompatible>true</IsAotCompatible>` and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>`, replacing reflection JSON serialization in `McpServer` with zero-reflection `Utf8JsonWriter` / `JsonDocument` over Stdio.
-- **L2 Voronoi Routing in `IvfPqIndex`** — Coarse centroid probing now routes via minimum `L2DistanceSquared` matching K-Means Voronoi assignment, significantly improving recall.
-- **Safe Versioned VRAM Cache & `stackalloc` CUDA Launches** — Keyed GPU chunk caching by `(StorageId, ChunkIndex, Version)` and eliminated `GCHandle` boxing on kernel launches.
-- **Storage Bounds & Concurrency Hardening** — Atomic `ReaderWriterLockSlim` coordination in `VectorIndex` (with `leaveStorageOpen` support), bounds checks across all `IVectorStorage` backends, and 64-bit LRU counters in `PagedVectorStorage`.
-
----
-
-## 🆕 What's New in v1.0.8
-
-- **True Zero-Allocation HNSW Traversal** — Replaced per-query `PriorityQueue` heap allocations in `HnswVectorIndex.SearchLayer` with struct bounded heaps (`ValueMinHeap`, `ValueMaxHeap`) and `[ThreadStatic]` scratch buffers (`HnswSearchScratch`), achieving 0.0 bytes allocated per query.
-- **Zero-Allocation Search API** — Added `Search(ReadOnlySpan<float> query, Span<SearchResult> destination, int efSearch = 64)` overload.
-- **`Glacier.Vector.Benchmarks` Suite** — BenchmarkDotNet suite profiling SIMD vector distance kernels (AVX-512 / AVX2 / ARM Neon) and HNSW query throughput (41,398 QPS).
-- **Code Hygiene** — Removed dead `using Microsoft.Win32;` namespace import.
-- **140 unit tests** passing (100% green, including Hadamard/RaBitQ, INT8/UINT4 SWAR+SIMD parity, Split-K FP32 & `dp4a` INT8 CUDA parity).
-
----
-
-## 🆕 What's New in v1.0.7
-
-- **HNSW and IVF-PQ indexes: zero-allocation inner loops** — all hot traversal and search loops now operate without heap allocations.
-- **`Volatile.Write` atomic pointer swap in `MmfVectorStorage`** — ensures safe concurrent access when swapping the active memory-mapped file segment.
-- **16 tests** passing (100 %).
-
-## Credits
-
-Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## ❄️ Glacier Ecosystem & Support
-
-Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
-
-* 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
-* ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)
-* ❤️ **GitHub Sponsors**: [github.com/sponsors/ian-cowley](https://github.com/sponsors/ian-cowley)
-* 🐙 **All Repositories**: [github.com/ian-cowley](https://github.com/ian-cowley)
+Developed by Ian Cowley, Antigravity (Google DeepMind) and Claude.
