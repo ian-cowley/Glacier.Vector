@@ -8,7 +8,9 @@
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Vector.svg)](https://www.nuget.org/packages/Glacier.Vector/)
 [![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Vector.svg)](https://www.nuget.org/packages/Glacier.Vector/)
 
-`Glacier.Vector` is a pure C#, Native AOT-compatible (`IsAotCompatible=true`) vector search engine and quantization library for .NET 10. It provides AVX-512 / AVX2 / `Vector128` SIMD distance kernels, HNSW and IVF-PQ indexes, Hadamard/RaBitQ 1-bit rotation, pluggable RAM and disk-backed storages (`InMemoryVectorStorage`, `MmfVectorStorage`, `PagedVectorStorage`, `BinaryVectorStorage`), optional NVIDIA CUDA driver P/Invoke (`nvcuda.dll`), and an embedded MCP server (`Glacier.Vector.Host`).
+`Glacier.Vector` is an embedded vector search engine and similarity toolkit for C# and .NET 10.
+
+If you are building retrieval-augmented generation (RAG), semantic search, clustering, or local agent memory inside a .NET application, you often have to run an external Python/C++ vector service or marshal large float arrays across HTTP. `Glacier.Vector` keeps indexing, storage, quantization, and search in-process inside a single Native AOT-compatible .NET library—complete with exact scans, HNSW and IVF-PQ indexes, memory-mapped storage for datasets larger than RAM, and an optional stdio MCP server.
 
 Read the background write-up: [I built a zero-dependency C# vector database that saturates DDR5 RAM bandwidth](https://dev.to/iancowley/i-built-a-zero-dependency-c-vector-database-that-saturates-ddr5-ram-bandwidth-5f9a).
 
@@ -20,7 +22,7 @@ dotnet add package Glacier.Vector
 
 ## Quick Start
 
-### In-Memory Index & Search
+### Add and Search Embeddings In Memory
 
 ```csharp
 using Glacier.Vector.Index;
@@ -55,8 +57,7 @@ using var storage = new InMemoryVectorStorage(dimensions: 128);
 using var hnsw = new HnswVectorIndex(storage, m: 16, efConstruction: 64);
 
 Span<SearchResult> topK = stackalloc SearchResult[10];
-float[] query = new float[128];
-int found = hnsw.Search(query, topK, efSearch: 64);
+int found = hnsw.Search(new float[128], topK, efSearch: 64);
 
 // Optional 2D batch scan on NVIDIA CUDA (falls back automatically when unavailable)
 float[] db = new float[50_000 * 128];
@@ -65,14 +66,20 @@ float[] scores = new float[50_000 * 32];
 GpuVectorAccelerator.BatchScanGpu(db, queries, scores, vectorCount: 50_000, dimensions: 128, batchSize: 32, target: GpuTarget.Auto);
 ```
 
-## Key Capabilities
+## What You Can Do
 
-- **SIMD Distance & Quantized Kernels (`DistanceKernels`):** Dispatches AVX-512, AVX2/FMA (`vpmaddubsw` / `vpmaddwd`), and 32-bit SWAR fallbacks across FP32 (`DotProduct`, `CosineDistance`, `L2Distance`, `L2DistanceSquared`), binary `HammingDistance`, INT8 (`DotInt8`, `DotInt8Quantized`, `DotFloatInt8`), and packed UINT4 (`PackUInt4`, `DotUInt4Packed`, `DotUInt4PackedQuantized`).
-- **Hadamard / RaBitQ 1-Bit Compression (`HadamardProjection`):** Applies orthogonal FWHT rotation before 1-bit binarization (`RotateAndBinarize`) with asymmetric cosine/inner-product estimators.
-- **Indexes & Storage Backends:** Exact parallel `VectorIndex`, zero-alloc `HnswVectorIndex`, 32x-compressed `IvfPqIndex`, `InMemoryVectorStorage`, memory-mapped `MmfVectorStorage`, LRU-bounded `PagedVectorStorage`, and 1-bit `BinaryVectorStorage`.
-- **VRAM-Cached CUDA vs. CPU Tradeoff:** Cached VRAM Split-K FP32 (`ScanChunkGpu`) outperforms CPU SIMD FP32 when vector chunks stay resident in GPU memory. On single-shot uncached INT8 scans (`ScanChunkInt8Gpu`), host-to-device PCIe copy makes multi-core CPU SIMD INT8 faster.
+- **Pick exact or approximate search:** Run parallel exact cosine/dot/L2 search (`VectorIndex`), zero-allocation HNSW graph search (`HnswVectorIndex`), or 32x-compressed IVF-PQ search (`IvfPqIndex`).
+- **Fit your memory budget:** Store vectors in RAM (`InMemoryVectorStorage`), on disk via OS virtual memory (`MmfVectorStorage`), behind a strict byte-capped LRU cache (`PagedVectorStorage`), or as 1-bit packed binary codes (`BinaryVectorStorage`).
+- **Compress embeddings without losing speed:** Compute INT8, packed 4-bit UINT4, and Hadamard-rotated 1-bit RaBitQ similarities using vectorized AVX-512 / AVX2 kernels or portable fallbacks.
+- **Connect AI coding agents directly:** Run `Glacier.Vector.Host` over stdio JSON-RPC to expose `add_vector`, `search_vectors`, and `ping` via the Model Context Protocol.
 
-## Measured Benchmarks
+## Platform & Compatibility
+
+- Runs on Windows, Linux, and macOS (.NET 10, Native AOT compatible).
+- Optional GPU scanning uses NVIDIA CUDA driver bindings (`nvcuda.dll` / `libcuda.so.1`) and falls back automatically to multi-core CPU SIMD when unavailable.
+- Caching FP32 database chunks in VRAM beats CPU FP32 scans, whereas one-shot uncached INT8 scans pay host-to-device PCIe copy overhead that makes multi-core CPU SIMD INT8 faster.
+
+## Benchmarks
 
 Measured in Release on **AMD Ryzen AI 9 HX 370 (12C/24T Zen 5, AVX-512) + NVIDIA GeForce RTX 4060 Laptop GPU (8 GB), 31 GB RAM, Windows 11, .NET 10.0.15 (.NET SDK 11.0.100)**:
 
@@ -93,9 +100,9 @@ dotnet run --project benchmarks/Glacier.Vector.Benchmarks/Glacier.Vector.Benchma
 
 ## Documentation
 
-- [Usage Guide](docs/usage.md) — storage choices, IVF-PQ, quantized scans, Hadamard projection, and demo app
-- [Architecture](docs/architecture.md) — memory layout, SIMD dispatch, zero-alloc HNSW/IVF-PQ, and CUDA VRAM caching
-- [Benchmarks](docs/benchmarks.md) — complete kernel, scan, HNSW, IVF-PQ, and storage backend measurements
+- [User Manual](docs/manual.md) — storage choices, exact/HNSW/IVF-PQ tuning, distance kernels, Hadamard 1-bit compression, and GPU scans
+- [Architecture](docs/architecture.md) — chunk layout, SIMD intrinsics dispatch, zero-alloc HNSW heaps, and CUDA VRAM cache design
+- [Benchmarks](docs/benchmarks.md) — complete kernel, scan, HNSW, IVF-PQ, and storage measurements
 - [MCP Server Setup](docs/mcp.md) — building and configuring `Glacier.Vector.Host` for MCP clients
 - [Changelog](CHANGELOG.md) — release notes
 
