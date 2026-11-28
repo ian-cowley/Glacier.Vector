@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
@@ -31,6 +32,11 @@ namespace Glacier.Vector.Storage
         /// Retrieves a vector by its zero-based index without allocating memory.
         /// </summary>
         ReadOnlySpan<float> GetVector(int index);
+
+        /// <summary>
+        /// Copies the vector at the specified zero-based index into <paramref name="destination"/>.
+        /// </summary>
+        void ReadVector(int index, Span<float> destination) => GetVector(index).CopyTo(destination);
 
         /// <summary>
         /// Appends a new vector to the storage.
@@ -87,7 +93,7 @@ namespace Glacier.Vector.Storage
             float[]? chunk = Volatile.Read(ref chunks[chunkIndex]);
             if (chunk == null) return ReadOnlySpan<float>.Empty;
             int count = GetChunkVectorCount(chunkIndex);
-            return new ReadOnlySpan<float>(chunk, 0, count * Dimensions);
+            return new ReadOnlySpan<float>(chunk, 0, checked((int)((long)count * Dimensions)));
         }
 
         public int GetChunkVectorCount(int chunkIndex)
@@ -108,7 +114,7 @@ namespace Glacier.Vector.Storage
             Dimensions = dimensions;
             _vectorsPerChunk = vectorsPerChunk;
             _chunks = new float[1024][];
-            _chunks[0] = new float[vectorsPerChunk * dimensions];
+            _chunks[0] = new float[checked((int)((long)vectorsPerChunk * dimensions))];
             _currentChunkIndex = 0;
             _currentChunkVectorCount = 0;
             _count = 0;
@@ -121,13 +127,21 @@ namespace Glacier.Vector.Storage
                 throw new ArgumentOutOfRangeException(nameof(index));
 
             int chunkIdx = index / _vectorsPerChunk;
-            int offsetInChunk = (index % _vectorsPerChunk) * Dimensions;
+            int offsetInChunk = checked((int)((long)(index % _vectorsPerChunk) * Dimensions));
             float[]?[] chunks = Volatile.Read(ref _chunks);
             float[]? chunk = Volatile.Read(ref chunks[chunkIdx]);
             if (chunk == null)
                 throw new ObjectDisposedException(nameof(InMemoryVectorStorage));
 
             return new ReadOnlySpan<float>(chunk, offsetInChunk, Dimensions);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ReadVector(int index, Span<float> destination)
+        {
+            if (destination.Length < Dimensions)
+                throw new ArgumentException($"Destination span length ({destination.Length}) is smaller than Dimensions ({Dimensions}).", nameof(destination));
+            GetVector(index).CopyTo(destination);
         }
 
         public void Append(ReadOnlySpan<float> vector)
@@ -147,7 +161,7 @@ namespace Glacier.Vector.Storage
                         Volatile.Write(ref _chunks, newChunks);
                     }
 
-                    var newChunk = new float[_vectorsPerChunk * Dimensions];
+                    var newChunk = new float[checked((int)((long)_vectorsPerChunk * Dimensions))];
                     vector.CopyTo(new Span<float>(newChunk, 0, Dimensions));
 
                     // Publish populated chunk and reset per-chunk count BEFORE advancing _currentChunkIndex
@@ -163,7 +177,7 @@ namespace Glacier.Vector.Storage
                 if (currentChunk == null)
                     throw new ObjectDisposedException(nameof(InMemoryVectorStorage));
 
-                int offset = _currentChunkVectorCount * Dimensions;
+                int offset = checked((int)((long)_currentChunkVectorCount * Dimensions));
                 vector.CopyTo(new Span<float>(currentChunk, offset, Dimensions));
 
                 Volatile.Write(ref _currentChunkVectorCount, _currentChunkVectorCount + 1);
@@ -191,6 +205,10 @@ namespace Glacier.Vector.Storage
     /// </summary>
     public unsafe class MmfVectorStorage : IVectorStorage
     {
+        private const uint HeaderMagic = 0x564D4C47u; // "GLMV"
+        private const int HeaderVersion = 1;
+        private const int HeaderSize = 64;
+
         public int Dimensions { get; }
         public int Count => Volatile.Read(ref _count);
         public long StorageId { get; } = StorageIdGenerator.Next();
@@ -200,17 +218,17 @@ namespace Glacier.Vector.Storage
         private long _version = 1;
         private readonly string _filePath;
         private readonly string _metaPath;
+        private readonly int _dataOffset;
         private FileStream _fileStream = null!;
-        private MemoryMappedFile _mmf = null!;
-        private MemoryMappedViewAccessor _accessor = null!;
+        private MemoryMappedFile? _mmf;
+        private MemoryMappedViewAccessor? _accessor;
         private IntPtr _basePointer;
         private bool _disposed;
+        private int _disposeFlag;
 
         // Start with a 64MB mapping segment and grow in 64MB increments to stay gentle on CI runners while amortizing remaps
         private const long GrowSize = 64L * 1024 * 1024;
         private long _currentCapacityBytes;
-        private readonly List<MemoryMappedFile> _oldMmfs = new();
-        private readonly List<MemoryMappedViewAccessor> _oldAccessors = new();
         private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.NoRecursion);
 
         public MmfVectorStorage(string filePath, int dimensions)
@@ -225,77 +243,176 @@ namespace Glacier.Vector.Storage
             bool fileExists = File.Exists(filePath);
             _fileStream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
 
-            long bytesPerVector = (long)dimensions * sizeof(float);
-            if (fileExists && _fileStream.Length > 0)
+            try
             {
-                long fileLength = _fileStream.Length;
-                long maxVectorsInFile = fileLength / bytesPerVector;
-
-                if (File.Exists(_metaPath))
+                long bytesPerVector = (long)dimensions * sizeof(float);
+                if (fileExists && _fileStream.Length > 0)
                 {
-                    try
+                    long fileLength = _fileStream.Length;
+                    Span<byte> headerBuf = stackalloc byte[HeaderSize];
+                    _fileStream.Position = 0;
+                    int headerRead = ReadAtLeastBytes(_fileStream, headerBuf);
+                    _fileStream.Position = 0;
+
+                    if (headerRead >= HeaderSize &&
+                        BinaryPrimitives.ReadUInt32LittleEndian(headerBuf) == HeaderMagic &&
+                        BinaryPrimitives.ReadInt32LittleEndian(headerBuf.Slice(4)) == HeaderVersion)
                     {
-                        byte[] metaBytes = File.ReadAllBytes(_metaPath);
-                        if (metaBytes.Length >= sizeof(int))
+                        int fileDims = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.Slice(8));
+                        if (fileDims != dimensions)
+                            throw new InvalidDataException($"MMF header dimension mismatch: expected {dimensions}, found {fileDims}.");
+
+                        _dataOffset = HeaderSize;
+                        long maxVectorsInFile = Math.Max(0L, (fileLength - HeaderSize) / bytesPerVector);
+                        long recordedCount = BinaryPrimitives.ReadInt64LittleEndian(headerBuf.Slice(16));
+                        _count = (int)Math.Min(int.MaxValue, Math.Clamp(recordedCount, 0L, maxVectorsInFile));
+                        _currentCapacityBytes = Math.Max(fileLength, HeaderSize + bytesPerVector);
+                    }
+                    else
+                    {
+                        // Legacy headerless file compatibility (e.g., raw pre-sized binary vector files)
+                        _dataOffset = 0;
+                        long maxVectorsInFile = fileLength / bytesPerVector;
+
+                        if (File.Exists(_metaPath))
                         {
-                            int recordedCount = BitConverter.ToInt32(metaBytes, 0);
-                            _count = (int)Math.Clamp(recordedCount, 0, maxVectorsInFile);
+                            try
+                            {
+                                byte[] metaBytes = File.ReadAllBytes(_metaPath);
+                                if (metaBytes.Length >= sizeof(int))
+                                {
+                                    int recordedCount = BitConverter.ToInt32(metaBytes, 0);
+                                    _count = (int)Math.Min(int.MaxValue, Math.Clamp((long)recordedCount, 0L, maxVectorsInFile));
+                                }
+                                else
+                                {
+                                    _count = (int)Math.Min(int.MaxValue, maxVectorsInFile);
+                                }
+                            }
+                            catch
+                            {
+                                _count = (int)Math.Min(int.MaxValue, maxVectorsInFile);
+                            }
                         }
                         else
                         {
-                            _count = (int)maxVectorsInFile;
+                            _count = (int)Math.Min(int.MaxValue, maxVectorsInFile);
                         }
+
+                        _currentCapacityBytes = Math.Max(fileLength, bytesPerVector);
                     }
-                    catch
+
+                    if (_fileStream.Length < _currentCapacityBytes)
                     {
-                        _count = (int)maxVectorsInFile;
+                        _fileStream.SetLength(_currentCapacityBytes);
                     }
                 }
                 else
                 {
-                    _count = (int)maxVectorsInFile;
-                }
-
-                _currentCapacityBytes = Math.Max(fileLength, bytesPerVector);
-                if (_fileStream.Length < _currentCapacityBytes)
-                {
+                    _dataOffset = HeaderSize;
+                    _count = 0;
+                    _currentCapacityBytes = Math.Max(GrowSize, HeaderSize + bytesPerVector);
                     _fileStream.SetLength(_currentCapacityBytes);
-                }
-            }
-            else
-            {
-                _count = 0;
-                _currentCapacityBytes = Math.Max(GrowSize, bytesPerVector);
-                _fileStream.SetLength(_currentCapacityBytes);
-                WriteCountMetadata(0);
-            }
 
-            InitializeMapping();
+                    Span<byte> headerBuf = stackalloc byte[HeaderSize];
+                    headerBuf.Clear();
+                    BinaryPrimitives.WriteUInt32LittleEndian(headerBuf, HeaderMagic);
+                    BinaryPrimitives.WriteInt32LittleEndian(headerBuf.Slice(4), HeaderVersion);
+                    BinaryPrimitives.WriteInt32LittleEndian(headerBuf.Slice(8), dimensions);
+                    BinaryPrimitives.WriteInt64LittleEndian(headerBuf.Slice(16), 0L);
+                    BinaryPrimitives.WriteInt64LittleEndian(headerBuf.Slice(24), _version);
+                    _fileStream.Position = 0;
+                    _fileStream.Write(headerBuf);
+                    _fileStream.Flush(flushToDisk: true);
+                    _fileStream.Position = 0;
+                }
+
+                InitializeMapping();
+            }
+            catch
+            {
+                ReleaseMappingHandles();
+                try { _fileStream?.Dispose(); } catch { }
+                _rwLock.Dispose();
+                throw;
+            }
+        }
+
+        private static int ReadAtLeastBytes(Stream stream, Span<byte> buffer)
+        {
+            int total = 0;
+            while (total < buffer.Length)
+            {
+                int read = stream.Read(buffer.Slice(total));
+                if (read == 0) break;
+                total += read;
+            }
+            return total;
         }
 
         private void WriteCountMetadata(int count)
         {
+            string tempPath = $"{_metaPath}.{Guid.NewGuid():N}.tmp";
             try
             {
                 Span<byte> buf = stackalloc byte[sizeof(int)];
                 BitConverter.TryWriteBytes(buf, count);
-                using var fs = new FileStream(_metaPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
-                fs.Write(buf);
+                using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    fs.Write(buf);
+                    fs.Flush(flushToDisk: true);
+                }
+                File.Move(tempPath, _metaPath, overwrite: true);
             }
             catch
             {
                 // Best-effort crash recovery sidecar
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
             }
+        }
+
+        private void ReleaseMappingHandles()
+        {
+            if (_basePointer != IntPtr.Zero)
+            {
+                try { _accessor?.Flush(); } catch { }
+                try { _accessor?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                Volatile.Write(ref _basePointer, IntPtr.Zero);
+            }
+            try { _accessor?.Dispose(); } catch { }
+            _accessor = null;
+            try { _mmf?.Dispose(); } catch { }
+            _mmf = null;
         }
 
         private void InitializeMapping()
         {
-            _mmf = MemoryMappedFile.CreateFromFile(_fileStream, null, _currentCapacityBytes, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, false);
-            _accessor = _mmf.CreateViewAccessor(0, _currentCapacityBytes, MemoryMappedFileAccess.ReadWrite);
+            MemoryMappedFile? mmf = null;
+            MemoryMappedViewAccessor? accessor = null;
+            bool pointerAcquired = false;
+            try
+            {
+                mmf = MemoryMappedFile.CreateFromFile(_fileStream, null, _currentCapacityBytes, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
+                accessor = mmf.CreateViewAccessor(0, _currentCapacityBytes, MemoryMappedFileAccess.ReadWrite);
 
-            byte* newPtr = null;
-            _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref newPtr);
-            Volatile.Write(ref _basePointer, (IntPtr)newPtr);
+                byte* newPtr = null;
+                accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref newPtr);
+                pointerAcquired = true;
+
+                _mmf = mmf;
+                _accessor = accessor;
+                Volatile.Write(ref _basePointer, (IntPtr)newPtr);
+            }
+            catch
+            {
+                if (pointerAcquired && accessor != null)
+                {
+                    try { accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                }
+                try { accessor?.Dispose(); } catch { }
+                try { mmf?.Dispose(); } catch { }
+                throw;
+            }
         }
 
         public int ChunkCount => 1;
@@ -303,10 +420,12 @@ namespace Glacier.Vector.Storage
         public ReadOnlySpan<float> GetChunkSpan(int chunkIndex)
         {
             if (chunkIndex != 0) throw new ArgumentOutOfRangeException(nameof(chunkIndex));
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             int count = Volatile.Read(ref _count);
             byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
             if (basePtr == null || count == 0) return ReadOnlySpan<float>.Empty;
-            return new ReadOnlySpan<float>((float*)basePtr, count * Dimensions);
+            int totalFloats = checked((int)((long)count * Dimensions));
+            return new ReadOnlySpan<float>((float*)(basePtr + _dataOffset), totalFloats);
         }
 
         public int GetChunkVectorCount(int chunkIndex)
@@ -315,44 +434,71 @@ namespace Glacier.Vector.Storage
             return Volatile.Read(ref _count);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<float> GetVector(int index)
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             if ((uint)index >= (uint)Volatile.Read(ref _count))
                 throw new ArgumentOutOfRangeException(nameof(index));
 
-            byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
-            if (basePtr == null)
+            float[] copy = new float[Dimensions];
+            ReadVector(index, copy);
+            return copy;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ReadVector(int index, Span<float> destination)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            if (destination.Length < Dimensions)
+                throw new ArgumentException($"Destination span length ({destination.Length}) is smaller than Dimensions ({Dimensions}).", nameof(destination));
+
+            try
             {
                 _rwLock.EnterReadLock();
-                try
-                {
-                    basePtr = (byte*)Volatile.Read(ref _basePointer);
-                }
-                finally
-                {
-                    _rwLock.ExitReadLock();
-                }
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new ObjectDisposedException(nameof(MmfVectorStorage), "Storage is unmapped or disposed.");
             }
 
-            if (basePtr == null)
-                throw new ObjectDisposedException(nameof(MmfVectorStorage), "Storage is unmapped or disposed.");
+            try
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if ((uint)index >= (uint)_count)
+                    throw new ArgumentOutOfRangeException(nameof(index));
 
-            float* floatPtr = (float*)basePtr;
-            long offset = (long)index * Dimensions;
-            return new ReadOnlySpan<float>(floatPtr + offset, Dimensions);
+                byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
+                if (basePtr == null)
+                    throw new ObjectDisposedException(nameof(MmfVectorStorage), "Storage is unmapped or disposed.");
+
+                float* floatPtr = (float*)(basePtr + _dataOffset + (long)index * Dimensions * sizeof(float));
+                new ReadOnlySpan<float>(floatPtr, Dimensions).CopyTo(destination);
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
         }
 
         public void Append(ReadOnlySpan<float> vector)
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            _rwLock.EnterWriteLock();
+            try
+            {
+                _rwLock.EnterWriteLock();
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new ObjectDisposedException(nameof(MmfVectorStorage), "Storage is unmapped or disposed.");
+            }
+
             try
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
-                long bytesRequired = (long)(_count + 1) * Dimensions * sizeof(float);
+                long bytesRequired = _dataOffset + (long)(_count + 1) * Dimensions * sizeof(float);
 
                 if (bytesRequired > _currentCapacityBytes)
                 {
@@ -360,19 +506,35 @@ namespace Glacier.Vector.Storage
                 }
 
                 byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
-                float* floatPtr = (float*)basePtr;
-                long offset = (long)_count * Dimensions;
+                if (basePtr == null)
+                    throw new ObjectDisposedException(nameof(MmfVectorStorage), "Storage is unmapped or disposed.");
+
+                float* floatPtr = (float*)(basePtr + _dataOffset + (long)_count * Dimensions * sizeof(float));
 
                 fixed (float* src = vector)
                 {
                     Unsafe.CopyBlockUnaligned(
-                        floatPtr + offset,
+                        floatPtr,
                         src,
                         (uint)(Dimensions * sizeof(float)));
                 }
 
-                Volatile.Write(ref _count, _count + 1);
-                Interlocked.Increment(ref _version);
+                Thread.MemoryBarrier();
+
+                int newCount = _count + 1;
+                long newVersion = _version + 1;
+                if (_dataOffset == HeaderSize)
+                {
+                    Volatile.Write(ref *(long*)(basePtr + 16), (long)newCount);
+                    Volatile.Write(ref *(long*)(basePtr + 24), newVersion);
+                }
+                else
+                {
+                    WriteCountMetadata(newCount);
+                }
+
+                Volatile.Write(ref _count, newCount);
+                Volatile.Write(ref _version, newVersion);
             }
             finally
             {
@@ -382,8 +544,7 @@ namespace Glacier.Vector.Storage
 
         private void ExpandMapping(long minRequiredBytes)
         {
-            if (_accessor != null) _oldAccessors.Add(_accessor);
-            if (_mmf != null) _oldMmfs.Add(_mmf);
+            ReleaseMappingHandles();
 
             while (_currentCapacityBytes < minRequiredBytes)
             {
@@ -396,42 +557,39 @@ namespace Glacier.Vector.Storage
 
         public void Dispose()
         {
-            if (_disposed) return;
+            if (Interlocked.Exchange(ref _disposeFlag, 1) != 0) return;
 
-            _rwLock.EnterWriteLock();
+            try
+            {
+                _rwLock.EnterWriteLock();
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
             try
             {
                 if (_disposed) return;
                 _disposed = true;
 
-                if (_basePointer != IntPtr.Zero)
+                byte* basePtr = (byte*)Volatile.Read(ref _basePointer);
+                if (_dataOffset == HeaderSize && basePtr != null)
                 {
-                    _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
-                    Volatile.Write(ref _basePointer, IntPtr.Zero);
+                    Volatile.Write(ref *(long*)(basePtr + 16), (long)_count);
+                    Volatile.Write(ref *(long*)(basePtr + 24), _version);
                 }
-                _accessor?.Dispose();
-                _mmf?.Dispose();
 
-                foreach (var acc in _oldAccessors)
-                {
-                    try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-                    acc.Dispose();
-                }
-                _oldAccessors.Clear();
+                ReleaseMappingHandles();
 
-                foreach (var m in _oldMmfs)
-                {
-                    m.Dispose();
-                }
-                _oldMmfs.Clear();
-
-                long exactBytes = (long)_count * Dimensions * sizeof(float);
+                long exactBytes = _dataOffset + (long)_count * Dimensions * sizeof(float);
                 try { _fileStream?.SetLength(exactBytes); } catch { }
+                try { _fileStream?.Flush(flushToDisk: true); } catch { }
                 _fileStream?.Dispose();
 
-                if (File.Exists(_metaPath))
+                if (_dataOffset == 0)
                 {
-                    try { File.Delete(_metaPath); } catch { }
+                    WriteCountMetadata(_count);
                 }
 
                 Interlocked.Increment(ref _version);
@@ -455,6 +613,8 @@ namespace Glacier.Vector.Storage
         public int ChunkCount => 0;
 
         private int _count;
+        private bool _disposed;
+        private int _disposeFlag;
         private readonly string _filePath;
         private readonly FileStream _fileStream;
         private readonly object _lock = new object();
@@ -466,28 +626,25 @@ namespace Glacier.Vector.Storage
         private readonly long[] _pageAccess;
         private long _accessCounter = 0;
 
-        [ThreadStatic]
-        private static float[][]? _threadLocalBuffers;
-        [ThreadStatic]
-        private static int _bufferIndex;
-
         public PagedVectorStorage(string filePath, int dimensions, int maxMemoryBytes = 256 * 1024)
         {
             if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("File path is required.", nameof(filePath));
             if (dimensions <= 0) throw new ArgumentOutOfRangeException(nameof(dimensions));
+            if (maxMemoryBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxMemoryBytes));
 
             Dimensions = dimensions;
             _filePath = filePath;
 
-            int bytesPerVector = dimensions * sizeof(float);
-            _pageSize = Math.Max(4096, ((4096 + bytesPerVector - 1) / bytesPerVector) * bytesPerVector);
+            long bytesPerVector = (long)dimensions * sizeof(float);
+            long pageSizeLong = Math.Max(4096L, ((4096L + bytesPerVector - 1L) / bytesPerVector) * bytesPerVector);
+            _pageSize = checked((int)pageSizeLong);
 
             bool fileExists = File.Exists(filePath);
             _fileStream = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.RandomAccess);
 
             if (fileExists && _fileStream.Length > 0)
             {
-                _count = (int)(_fileStream.Length / bytesPerVector);
+                _count = checked((int)(_fileStream.Length / bytesPerVector));
             }
             else
             {
@@ -545,49 +702,51 @@ namespace Glacier.Vector.Storage
             return _pages[cacheSlot];
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ReadOnlySpan<float> GetVector(int index)
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             if ((uint)index >= (uint)Volatile.Read(ref _count))
                 throw new ArgumentOutOfRangeException(nameof(index));
 
-            if (_threadLocalBuffers == null)
-            {
-                _threadLocalBuffers = new float[4][];
-            }
+            float[] copy = new float[Dimensions];
+            ReadVector(index, copy);
+            return copy;
+        }
 
-            _bufferIndex = (_bufferIndex + 1) & 3;
-
-            if (_threadLocalBuffers[_bufferIndex] == null || _threadLocalBuffers[_bufferIndex].Length < Dimensions)
-            {
-                _threadLocalBuffers[_bufferIndex] = new float[Dimensions];
-            }
-
-            float[] buffer = _threadLocalBuffers[_bufferIndex];
-
-            long byteOffset = (long)index * Dimensions * sizeof(float);
-            long pageIndex = byteOffset / _pageSize;
-            int inPageOffset = (int)(byteOffset % _pageSize);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ReadVector(int index, Span<float> destination)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            if (destination.Length < Dimensions)
+                throw new ArgumentException($"Destination span length ({destination.Length}) is smaller than Dimensions ({Dimensions}).", nameof(destination));
 
             lock (_lock)
             {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if ((uint)index >= (uint)_count)
+                    throw new ArgumentOutOfRangeException(nameof(index));
+
+                long byteOffset = (long)index * Dimensions * sizeof(float);
+                long pageIndex = byteOffset / _pageSize;
+                int inPageOffset = (int)(byteOffset % _pageSize);
+
                 ReadOnlySpan<byte> pageSpan = GetPage(pageIndex);
                 var floatSpan = MemoryMarshal.Cast<byte, float>(pageSpan.Slice(inPageOffset, Dimensions * sizeof(float)));
-                floatSpan.CopyTo(buffer);
+                floatSpan.CopyTo(destination);
             }
-
-            return buffer.AsSpan(0, Dimensions);
         }
 
         public void Append(ReadOnlySpan<float> vector)
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            int bytesPerVector = Dimensions * sizeof(float);
+            long bytesPerVector = (long)Dimensions * sizeof(float);
 
             lock (_lock)
             {
+                ObjectDisposedException.ThrowIf(_disposed, this);
                 long fileOffset = (long)_count * bytesPerVector;
                 var byteSpan = MemoryMarshal.AsBytes(vector);
                 RandomAccess.Write(_fileStream.SafeFileHandle, byteSpan, fileOffset);
@@ -608,8 +767,12 @@ namespace Glacier.Vector.Storage
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposeFlag, 1) != 0) return;
+
             lock (_lock)
             {
+                if (_disposed) return;
+                Volatile.Write(ref _disposed, true);
                 _fileStream?.Dispose();
             }
         }

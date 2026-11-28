@@ -40,11 +40,13 @@ namespace Glacier.Vector.Index
     public class VectorIndex : IDisposable
     {
         private readonly IVectorStorage _storage;
+        private readonly bool _isZeroCopyStorage;
         private readonly BinaryVectorStorage _binaryStorage;
         private readonly bool _leaveStorageOpen;
         private readonly List<string> _metadata;
         private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.SupportsRecursion);
         private bool _disposed;
+        private int _disposeFlag;
 
         public int Dimensions => _storage.Dimensions;
         public int Count => _storage.Count;
@@ -57,13 +59,72 @@ namespace Glacier.Vector.Index
         public VectorIndex(IVectorStorage storage, bool leaveStorageOpen)
         {
             _storage = storage ?? throw new ArgumentNullException(nameof(storage));
+            _isZeroCopyStorage = storage is InMemoryVectorStorage;
             _leaveStorageOpen = leaveStorageOpen;
             _binaryStorage = new BinaryVectorStorage(storage.Dimensions, Math.Max(16, storage.Count));
             _metadata = new List<string>(storage.Count);
-            for (int i = 0; i < storage.Count; i++)
+            if (storage.Count > 0)
             {
-                _metadata.Add(string.Empty);
-                _binaryStorage.Append(storage.GetVector(i));
+                float[]? scratch = _isZeroCopyStorage ? null : ArrayPool<float>.Shared.Rent(storage.Dimensions);
+                try
+                {
+                    for (int i = 0; i < storage.Count; i++)
+                    {
+                        _metadata.Add(string.Empty);
+                        if (_isZeroCopyStorage)
+                        {
+                            _binaryStorage.Append(storage.GetVector(i));
+                        }
+                        else
+                        {
+                            Span<float> buf = scratch.AsSpan(0, storage.Dimensions);
+                            storage.ReadVector(i, buf);
+                            _binaryStorage.Append(buf);
+                        }
+                    }
+                }
+                finally
+                {
+                    if (scratch != null) ArrayPool<float>.Shared.Return(scratch);
+                }
+            }
+        }
+
+        private void EnterReadLockSafe()
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            try
+            {
+                _rwLock.EnterReadLock();
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new ObjectDisposedException(nameof(VectorIndex));
+            }
+
+            if (_disposed)
+            {
+                _rwLock.ExitReadLock();
+                throw new ObjectDisposedException(nameof(VectorIndex));
+            }
+        }
+
+        private void EnterWriteLockSafe()
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            try
+            {
+                _rwLock.EnterWriteLock();
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new ObjectDisposedException(nameof(VectorIndex));
+            }
+
+            if (_disposed)
+            {
+                _rwLock.ExitWriteLock();
+                throw new ObjectDisposedException(nameof(VectorIndex));
             }
         }
 
@@ -73,11 +134,11 @@ namespace Glacier.Vector.Index
         /// </summary>
         public void Add(ReadOnlySpan<float> vector, string metadata)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             if (vector.Length != Dimensions)
                 throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-            _rwLock.EnterWriteLock();
+            EnterWriteLockSafe();
             try
             {
                 _storage.Append(vector);
@@ -109,7 +170,7 @@ namespace Glacier.Vector.Index
         }
 
         /// <summary>
-        /// Performs nearest neighbor search on the specified hardware target (Auto, Nvidia, Amd, or Cpu).
+        /// Performs nearest neighbor search on the specified hardware target (Auto, Nvidia, or Cpu).
         /// </summary>
         public unsafe SearchResult[] Search(
             ReadOnlySpan<float> query,
@@ -117,7 +178,10 @@ namespace Glacier.Vector.Index
             GpuTarget target = GpuTarget.Auto,
             int maxDegreeOfParallelism = 0)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            if (target is GpuTarget.Amd or GpuTarget.DualGpu)
+                throw new NotSupportedException($"GPU target '{target}' is not supported. Use GpuTarget.Auto, GpuTarget.Nvidia, or GpuTarget.Cpu.");
+
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
@@ -134,7 +198,7 @@ namespace Glacier.Vector.Index
 
         private unsafe SearchResult[]? TryGpuSearch(ReadOnlySpan<float> query, int topK, GpuTarget target)
         {
-            _rwLock.EnterReadLock();
+            EnterReadLockSafe();
             try
             {
                 int totalCount = _storage.Count;
@@ -225,28 +289,32 @@ namespace Glacier.Vector.Index
             int topK = 5,
             GpuTarget target = GpuTarget.Auto)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            if (target is GpuTarget.Amd or GpuTarget.DualGpu)
+                throw new NotSupportedException($"GPU target '{target}' is not supported. Use GpuTarget.Auto, GpuTarget.Nvidia, or GpuTarget.Cpu.");
+
             if (batchSize <= 0 || topK <= 0)
                 return Array.Empty<SearchResult[]>();
 
-            if (queries.Length < batchSize * Dimensions)
+            if ((long)queries.Length < (long)batchSize * Dimensions)
                 throw new ArgumentException("Queries span length does not match batchSize * Dimensions.");
 
             var batchResults = new SearchResult[batchSize][];
 
-            _rwLock.EnterReadLock();
+            EnterReadLockSafe();
             try
             {
                 int totalCount = _storage.Count;
                 if (totalCount == 0)
                     return Array.Empty<SearchResult[]>();
 
-                if (target != GpuTarget.Cpu && totalCount >= 1024 && _storage.ChunkCount == 1 && GpuVectorAccelerator.IsGpuAvailable)
+                long matrixLenLong = (long)totalCount * batchSize;
+                if (target != GpuTarget.Cpu && totalCount >= 1024 && _storage.ChunkCount == 1 && matrixLenLong <= Array.MaxLength && GpuVectorAccelerator.IsGpuAvailable)
                 {
                     ReadOnlySpan<float> dbSpan = _storage.GetChunkSpan(0);
                     if (!dbSpan.IsEmpty)
                     {
-                        int matrixLen = totalCount * batchSize;
+                        int matrixLen = (int)matrixLenLong;
                         float[] pooledScoreMatrix = ArrayPool<float>.Shared.Rent(matrixLen);
 
                         try
@@ -273,7 +341,7 @@ namespace Glacier.Vector.Index
                                     float minScore = float.MinValue;
                                     for (int i = 0; i < totalCount; i++)
                                     {
-                                        float score = pooledScoreMatrix[i * batchSize + b];
+                                        float score = pooledScoreMatrix[(long)i * batchSize + b];
                                         if (queue.Count < topK || score > minScore)
                                         {
                                             queue.Enqueue(i, score);
@@ -331,7 +399,7 @@ namespace Glacier.Vector.Index
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
-            _rwLock.EnterReadLock();
+            EnterReadLockSafe();
             try
             {
                 int totalCount = _storage.Count;
@@ -415,22 +483,41 @@ namespace Glacier.Vector.Index
         {
             var localQueue = new PriorityQueue<int, float>(topK + 1);
             float localMinScore = float.MinValue;
+            float[]? scratch = _isZeroCopyStorage ? null : ArrayPool<float>.Shared.Rent(Dimensions);
 
-            for (int i = start; i < end; i++)
+            try
             {
-                ReadOnlySpan<float> dbVector = _storage.GetVector(i);
-                float score = DistanceKernels.DotProduct(querySpan, dbVector);
-
-                if (score > localMinScore || localQueue.Count < topK)
+                Span<float> scratchSpan = scratch != null ? scratch.AsSpan(0, Dimensions) : default;
+                for (int i = start; i < end; i++)
                 {
-                    localQueue.Enqueue(i, score);
-
-                    if (localQueue.Count > topK)
+                    ReadOnlySpan<float> dbVector;
+                    if (_isZeroCopyStorage)
                     {
-                        localQueue.Dequeue();
-                        localQueue.TryPeek(out _, out localMinScore);
+                        dbVector = _storage.GetVector(i);
+                    }
+                    else
+                    {
+                        _storage.ReadVector(i, scratchSpan);
+                        dbVector = scratchSpan;
+                    }
+
+                    float score = DistanceKernels.DotProduct(querySpan, dbVector);
+
+                    if (score > localMinScore || localQueue.Count < topK)
+                    {
+                        localQueue.Enqueue(i, score);
+
+                        if (localQueue.Count > topK)
+                        {
+                            localQueue.Dequeue();
+                            localQueue.TryPeek(out _, out localMinScore);
+                        }
                     }
                 }
+            }
+            finally
+            {
+                if (scratch != null) ArrayPool<float>.Shared.Return(scratch);
             }
 
             var results = new SearchResult[localQueue.Count];
@@ -456,12 +543,12 @@ namespace Glacier.Vector.Index
             int k = 5,
             int oversampleFactor = 8)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             if (query.Length != Dimensions)
                 throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
             if (k <= 0) return Array.Empty<SearchResult>();
 
-            _rwLock.EnterReadLock();
+            EnterReadLockSafe();
             try
             {
                 int total = _storage.Count;
@@ -474,61 +561,83 @@ namespace Glacier.Vector.Index
                 int numCandidates = Math.Clamp(k * oversampleFactor, k, total);
 
                 // Tier 1: Coarse 1-bit binary Hamming scan
-                Span<ulong> qBin = stackalloc ulong[_binaryStorage.WordsPerVector];
-                DistanceKernels.PackBinaryVector(query, qBin);
-
-                var candidateQueue = new PriorityQueue<int, int>(numCandidates);
-
-                for (int i = 0; i < total; i++)
+                int words = _binaryStorage.WordsPerVector;
+                const int StackAllocUlongLimit = 256;
+                ulong[]? rentedQBin = words > StackAllocUlongLimit ? ArrayPool<ulong>.Shared.Rent(words) : null;
+                float[]? scratchVec = _isZeroCopyStorage ? null : ArrayPool<float>.Shared.Rent(Dimensions);
+                try
                 {
-                    ReadOnlySpan<ulong> docBin = _binaryStorage.GetPackedVector(i);
-                    int dist = DistanceKernels.HammingDistance(qBin, docBin);
+                    Span<ulong> qBin = rentedQBin != null ? rentedQBin.AsSpan(0, words) : stackalloc ulong[words];
+                    DistanceKernels.PackBinaryVector(query, qBin);
 
-                    if (candidateQueue.Count < numCandidates)
+                    var candidateQueue = new PriorityQueue<int, int>(numCandidates);
+
+                    for (int i = 0; i < total; i++)
                     {
-                        candidateQueue.Enqueue(i, -dist);
-                    }
-                    else
-                    {
-                        if (candidateQueue.TryPeek(out _, out int maxDistNeg))
+                        ReadOnlySpan<ulong> docBin = _binaryStorage.GetPackedVector(i);
+                        int dist = DistanceKernels.HammingDistance(qBin, docBin);
+
+                        if (candidateQueue.Count < numCandidates)
                         {
-                            int currentMaxDist = -maxDistNeg;
-                            if (dist < currentMaxDist)
+                            candidateQueue.Enqueue(i, -dist);
+                        }
+                        else
+                        {
+                            if (candidateQueue.TryPeek(out _, out int maxDistNeg))
                             {
-                                candidateQueue.Dequeue();
-                                candidateQueue.Enqueue(i, -dist);
+                                int currentMaxDist = -maxDistNeg;
+                                if (dist < currentMaxDist)
+                                {
+                                    candidateQueue.Dequeue();
+                                    candidateQueue.Enqueue(i, -dist);
+                                }
                             }
                         }
                     }
-                }
 
-                int cCount = candidateQueue.Count;
-                int[] candidateIds = new int[cCount];
-                for (int i = 0; i < cCount; i++)
+                    int cCount = candidateQueue.Count;
+                    int[] candidateIds = new int[cCount];
+                    for (int i = 0; i < cCount; i++)
+                    {
+                        candidateIds[i] = candidateQueue.Dequeue();
+                    }
+
+                    // Tier 2: Exact FP32 Cosine Similarity Re-Ranking
+                    var exactResults = new List<SearchResult>(cCount);
+                    Span<float> vecBuf = scratchVec != null ? scratchVec.AsSpan(0, Dimensions) : default;
+                    for (int i = 0; i < cCount; i++)
+                    {
+                        int docId = candidateIds[i];
+                        ReadOnlySpan<float> docVec;
+                        if (_isZeroCopyStorage)
+                        {
+                            docVec = _storage.GetVector(docId);
+                        }
+                        else
+                        {
+                            _storage.ReadVector(docId, vecBuf);
+                            docVec = vecBuf;
+                        }
+                        float exactScore = DistanceKernels.DotProduct(query, docVec);
+                        string meta = docId < _metadata.Count ? _metadata[docId] : string.Empty;
+                        exactResults.Add(new SearchResult(docId, exactScore, meta));
+                    }
+
+                    exactResults.Sort(static (a, b) => b.Score.CompareTo(a.Score));
+
+                    int resultCount = Math.Min(k, exactResults.Count);
+                    var results = new SearchResult[resultCount];
+                    for (int i = 0; i < resultCount; i++)
+                    {
+                        results[i] = exactResults[i];
+                    }
+                    return results;
+                }
+                finally
                 {
-                    candidateIds[i] = candidateQueue.Dequeue();
+                    if (rentedQBin != null) ArrayPool<ulong>.Shared.Return(rentedQBin);
+                    if (scratchVec != null) ArrayPool<float>.Shared.Return(scratchVec);
                 }
-
-                // Tier 2: Exact FP32 Cosine Similarity Re-Ranking
-                var exactResults = new List<SearchResult>(cCount);
-                for (int i = 0; i < cCount; i++)
-                {
-                    int docId = candidateIds[i];
-                    ReadOnlySpan<float> docVec = _storage.GetVector(docId);
-                    float exactScore = DistanceKernels.DotProduct(query, docVec);
-                    string meta = docId < _metadata.Count ? _metadata[docId] : string.Empty;
-                    exactResults.Add(new SearchResult(docId, exactScore, meta));
-                }
-
-                exactResults.Sort(static (a, b) => b.Score.CompareTo(a.Score));
-
-                int resultCount = Math.Min(k, exactResults.Count);
-                var results = new SearchResult[resultCount];
-                for (int i = 0; i < resultCount; i++)
-                {
-                    results[i] = exactResults[i];
-                }
-                return results;
             }
             finally
             {
@@ -538,15 +647,33 @@ namespace Glacier.Vector.Index
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
+            if (Interlocked.Exchange(ref _disposeFlag, 1) != 0) return;
 
-            if (!_leaveStorageOpen)
+            try
             {
-                _storage?.Dispose();
+                _rwLock.EnterWriteLock();
             }
-            _binaryStorage?.Dispose();
-            _rwLock.Dispose();
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_disposed) return;
+                Volatile.Write(ref _disposed, true);
+
+                if (!_leaveStorageOpen)
+                {
+                    _storage?.Dispose();
+                }
+                _binaryStorage?.Dispose();
+            }
+            finally
+            {
+                _rwLock.ExitWriteLock();
+                _rwLock.Dispose();
+            }
         }
     }
 }

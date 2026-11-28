@@ -35,7 +35,7 @@ namespace Glacier.Vector.Host
             using var index = new VectorIndex(storage);
 
             // Create and run the MCP server
-            var server = inputStream != null && outputStream != null
+            using var server = inputStream != null && outputStream != null
                 ? new McpServer(index, inputStream, outputStream)
                 : new McpServer(index);
 

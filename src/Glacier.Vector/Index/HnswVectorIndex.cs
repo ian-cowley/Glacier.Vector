@@ -16,12 +16,15 @@ using Glacier.Vector.Storage;
 public sealed class HnswVectorIndex : IDisposable
 {
     private readonly IVectorStorage _storage;
+    private readonly bool _isZeroCopyStorage;
     private readonly int _m;
     private readonly int _m0;
     private readonly int _efConstruction;
     private readonly double _mL;
     private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.SupportsRecursion);
     private readonly List<string> _metadata = new();
+    private bool _disposed;
+    private int _disposeFlag;
 
     // Contiguous graph adjacency storage:
     // Node ID * M0 -> list of neighbor IDs (terminated by -1)
@@ -51,22 +54,91 @@ public sealed class HnswVectorIndex : IDisposable
         int initialCapacity = 65536)
     {
         _storage = storage ?? throw new ArgumentNullException(nameof(storage));
+        ArgumentOutOfRangeException.ThrowIfLessThan(m, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(efConstruction, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(initialCapacity, 1);
+
+        _isZeroCopyStorage = storage is InMemoryVectorStorage;
         _m = m;
-        _m0 = 2 * m;
+        _m0 = checked(2 * m);
         _efConstruction = efConstruction;
         _mL = 1.0 / Math.Log(m > 1 ? m : 2);
 
         int cap = Math.Max(initialCapacity, storage.Count + 16);
-        _layer0Edges = new int[cap * _m0];
+        _layer0Edges = new int[checked((int)((long)cap * _m0))];
         Array.Fill(_layer0Edges, -1);
         _nodeMaxLayers = new int[cap];
         Array.Fill(_nodeMaxLayers, -1);
 
         // If storage already contains vectors, index them
-        for (int i = 0; i < storage.Count; i++)
+        if (storage.Count > 0)
         {
-            _metadata.Add(string.Empty);
-            InsertInternal(i, storage.GetVector(i));
+            float[]? initBuf = _isZeroCopyStorage ? null : new float[Dimensions];
+            for (int i = 0; i < storage.Count; i++)
+            {
+                _metadata.Add(string.Empty);
+                ReadOnlySpan<float> vec;
+                if (_isZeroCopyStorage)
+                {
+                    vec = storage.GetVector(i);
+                }
+                else
+                {
+                    storage.ReadVector(i, initBuf);
+                    vec = initBuf.AsSpan(0, Dimensions);
+                }
+                InsertInternal(i, vec);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<float> ReadVectorInto(int index, float[] scratchBuffer)
+    {
+        if (_isZeroCopyStorage)
+        {
+            return _storage.GetVector(index);
+        }
+
+        _storage.ReadVector(index, scratchBuffer);
+        return scratchBuffer.AsSpan(0, Dimensions);
+    }
+
+    private void EnterReadLockSafe()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+        try
+        {
+            _rwLock.EnterReadLock();
+        }
+        catch (ObjectDisposedException)
+        {
+            throw new ObjectDisposedException(nameof(HnswVectorIndex));
+        }
+
+        if (_disposed)
+        {
+            _rwLock.ExitReadLock();
+            throw new ObjectDisposedException(nameof(HnswVectorIndex));
+        }
+    }
+
+    private void EnterWriteLockSafe()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+        try
+        {
+            _rwLock.EnterWriteLock();
+        }
+        catch (ObjectDisposedException)
+        {
+            throw new ObjectDisposedException(nameof(HnswVectorIndex));
+        }
+
+        if (_disposed)
+        {
+            _rwLock.ExitWriteLock();
+            throw new ObjectDisposedException(nameof(HnswVectorIndex));
         }
     }
 
@@ -75,15 +147,16 @@ public sealed class HnswVectorIndex : IDisposable
     /// </summary>
     public void Add(ReadOnlySpan<float> vector, string metadata = "")
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
         if (vector.Length != Dimensions)
             throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}");
 
-        _rwLock.EnterWriteLock();
+        EnterWriteLockSafe();
         try
         {
             int id = _storage.Count;
             _storage.Append(vector);
-            _metadata.Add(metadata);
+            _metadata.Add(metadata ?? string.Empty);
             InsertInternal(id, vector);
         }
         finally
@@ -96,11 +169,25 @@ public sealed class HnswVectorIndex : IDisposable
     /// Inserts an existing vector from storage by ID into the HNSW graph.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void Insert(int id, ReadOnlySpan<float> vector)
+    internal void Insert(int id, ReadOnlySpan<float> vector)
     {
-        _rwLock.EnterWriteLock();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+        if (vector.Length != Dimensions)
+            throw new ArgumentException($"Expected vector of dimension {Dimensions}, got {vector.Length}", nameof(vector));
+
+        EnterWriteLockSafe();
         try
         {
+            ArgumentOutOfRangeException.ThrowIfNegative(id);
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(id, _storage.Count);
+            if (id < _nodeMaxLayers.Length && _nodeMaxLayers[id] != -1)
+                throw new InvalidOperationException($"Node {id} is already inserted in the HNSW graph.");
+
+            while (_metadata.Count <= id)
+            {
+                _metadata.Add(string.Empty);
+            }
+
             InsertInternal(id, vector);
         }
         finally
@@ -123,8 +210,14 @@ public sealed class HnswVectorIndex : IDisposable
             return;
         }
 
+        var scratch = GetScratch();
+        if (!_isZeroCopyStorage)
+        {
+            scratch.EnsureVectorBuffers(Dimensions);
+        }
+
         int currObj = _enterNodeId;
-        float currDist = ComputeDistance(vector, _storage.GetVector(currObj));
+        float currDist = ComputeDistance(vector, ReadVectorInto(currObj, scratch.VecBufA));
 
         // Phase 1: Greedy search from top down to nodeLayer + 1
         for (int l = _maxLayer; l > nodeLayer; l--)
@@ -138,7 +231,7 @@ public sealed class HnswVectorIndex : IDisposable
                 {
                     int neighbor = neighbors[n];
                     if (neighbor == -1) break;
-                    float d = ComputeDistance(vector, _storage.GetVector(neighbor));
+                    float d = ComputeDistance(vector, ReadVectorInto(neighbor, scratch.VecBufA));
                     if (d < currDist)
                     {
                         currDist = d;
@@ -150,12 +243,11 @@ public sealed class HnswVectorIndex : IDisposable
         }
 
         // Phase 2: From min(maxLayer, nodeLayer) down to layer 0: search efConstruction and connect
-        var scratch = GetScratch();
         for (int l = Math.Min(_maxLayer, nodeLayer); l >= 0; l--)
         {
             SearchLayer(vector, currObj, _efConstruction, l, scratch);
             int bestCandidate = scratch.Results.FindMin().Id;
-            SelectAndLinkNeighbors(id, ref scratch.Results, l);
+            SelectAndLinkNeighbors(id, ref scratch.Results, l, scratch);
             if (bestCandidate != -1)
             {
                 currObj = bestCandidate;
@@ -176,18 +268,25 @@ public sealed class HnswVectorIndex : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public int Search(ReadOnlySpan<float> query, Span<SearchResult> destination, int efSearch = 64)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
         if (query.Length != Dimensions)
             throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
         if (destination.Length == 0) return 0;
 
-        _rwLock.EnterReadLock();
+        EnterReadLockSafe();
         try
         {
             if (_enterNodeId == -1) return 0;
 
+            var scratch = GetScratch();
+            if (!_isZeroCopyStorage)
+            {
+                scratch.EnsureVectorBuffers(Dimensions);
+            }
+
             int currObj = _enterNodeId;
-            float currDist = ComputeDistance(query, _storage.GetVector(currObj));
+            float currDist = ComputeDistance(query, ReadVectorInto(currObj, scratch.VecBufA));
 
             // Greedy routing in upper layers
             for (int l = _maxLayer; l > 0; l--)
@@ -201,7 +300,7 @@ public sealed class HnswVectorIndex : IDisposable
                     {
                         int neighbor = neighbors[n];
                         if (neighbor == -1) break;
-                        float d = ComputeDistance(query, _storage.GetVector(neighbor));
+                        float d = ComputeDistance(query, ReadVectorInto(neighbor, scratch.VecBufA));
                         if (d < currDist)
                         {
                             currDist = d;
@@ -215,7 +314,6 @@ public sealed class HnswVectorIndex : IDisposable
             // Beam search at layer 0
             int topK = destination.Length;
             int ef = Math.Max(efSearch, topK);
-            var scratch = GetScratch();
             SearchLayer(query, currObj, ef, 0, scratch);
 
             ref var w = ref scratch.Results;
@@ -234,7 +332,7 @@ public sealed class HnswVectorIndex : IDisposable
             for (int i = resultCount - 1; i >= 0; i--)
             {
                 w.TryDequeue(out int id, out _);
-                float score = DistanceKernels.DotProduct(query, _storage.GetVector(id));
+                float score = DistanceKernels.DotProduct(query, ReadVectorInto(id, scratch.VecBufA));
                 string meta = (id < metaCount) ? _metadata[id] : string.Empty;
                 destination[i] = new SearchResult(id, score, meta);
             }
@@ -254,12 +352,13 @@ public sealed class HnswVectorIndex : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public SearchResult[] Search(ReadOnlySpan<float> query, int topK, int efSearch = 64)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
         if (query.Length != Dimensions)
             throw new ArgumentException($"Expected query dimension {Dimensions}, got {query.Length}");
 
         if (topK <= 0) return Array.Empty<SearchResult>();
 
-        _rwLock.EnterReadLock();
+        EnterReadLockSafe();
         try
         {
             if (_enterNodeId == -1) return Array.Empty<SearchResult>();
@@ -303,7 +402,7 @@ public sealed class HnswVectorIndex : IDisposable
         candidates.Clear();
         results.Clear();
 
-        float dEnter = ComputeDistance(query, _storage.GetVector(enterNode));
+        float dEnter = ComputeDistance(query, ReadVectorInto(enterNode, scratch.VecBufA));
         candidates.Enqueue(enterNode, dEnter);
         results.Enqueue(enterNode, dEnter);
         scratch.VisitedTags[enterNode] = tag;
@@ -324,7 +423,7 @@ public sealed class HnswVectorIndex : IDisposable
                 if (scratch.VisitedTags[e] != tag)
                 {
                     scratch.VisitedTags[e] = tag;
-                    float dE = ComputeDistance(query, _storage.GetVector(e));
+                    float dE = ComputeDistance(query, ReadVectorInto(e, scratch.VecBufA));
 
                     results.Peek(out _, out worstDist);
 
@@ -383,7 +482,7 @@ public sealed class HnswVectorIndex : IDisposable
         return arr.AsSpan(upperOffset, _m);
     }
 
-    private void SelectAndLinkNeighbors(int id, ref ValueMaxHeap results, int layer)
+    private void SelectAndLinkNeighbors(int id, ref ValueMaxHeap results, int layer, HnswSearchScratch scratch)
     {
         int maxConn = layer == 0 ? _m0 : _m;
 
@@ -395,33 +494,46 @@ public sealed class HnswVectorIndex : IDisposable
         }
 
         int count = results.Count;
-        Span<int> selected = stackalloc int[count];
-        for (int i = count - 1; i >= 0; i--)
+        const int StackAllocIntLimit = 256;
+        int[]? rented = count > StackAllocIntLimit ? ArrayPool<int>.Shared.Rent(count) : null;
+        try
         {
-            results.TryDequeue(out int neighbor, out _);
-            selected[i] = neighbor;
-        }
+            Span<int> selected = rented != null ? rented.AsSpan(0, count) : stackalloc int[count];
+            for (int i = count - 1; i >= 0; i--)
+            {
+                results.TryDequeue(out int neighbor, out _);
+                selected[i] = neighbor;
+            }
 
-        var myNeighbors = GetNeighborsSpan(id, layer);
-        selected.CopyTo(myNeighbors);
-        if (selected.Length < maxConn)
-        {
-            myNeighbors.Slice(selected.Length).Fill(-1);
-        }
+            var myNeighbors = GetNeighborsSpan(id, layer);
+            selected.CopyTo(myNeighbors);
+            if (selected.Length < maxConn)
+            {
+                myNeighbors.Slice(selected.Length).Fill(-1);
+            }
 
-        for (int i = 0; i < selected.Length; i++)
+            for (int i = 0; i < selected.Length; i++)
+            {
+                AddBidirectionalEdge(selected[i], id, layer, maxConn, scratch);
+            }
+        }
+        finally
         {
-            AddBidirectionalEdge(selected[i], id, layer, maxConn);
+            if (rented != null)
+            {
+                ArrayPool<int>.Shared.Return(rented);
+            }
         }
     }
 
-    private void AddBidirectionalEdge(int from, int to, int layer, int maxConn)
+    private void AddBidirectionalEdge(int from, int to, int layer, int maxConn, HnswSearchScratch scratch)
     {
         var existing = GetNeighborsSpan(from, layer);
         int freeSlot = -1;
         int worstSlot = -1;
         float worstDist = float.MinValue;
-        float distToTo = ComputeDistance(_storage.GetVector(from), _storage.GetVector(to));
+        ReadOnlySpan<float> fromVec = ReadVectorInto(from, scratch.VecBufA);
+        float distToTo = ComputeDistance(fromVec, ReadVectorInto(to, scratch.VecBufB));
 
         for (int i = 0; i < maxConn; i++)
         {
@@ -432,7 +544,7 @@ public sealed class HnswVectorIndex : IDisposable
                 freeSlot = i;
                 break;
             }
-            float d = ComputeDistance(_storage.GetVector(from), _storage.GetVector(neighbor));
+            float d = ComputeDistance(fromVec, ReadVectorInto(neighbor, scratch.VecBufB));
             if (d > worstDist)
             {
                 worstDist = d;
@@ -482,7 +594,27 @@ public sealed class HnswVectorIndex : IDisposable
 
     public void Dispose()
     {
-        _rwLock.Dispose();
+        if (Interlocked.Exchange(ref _disposeFlag, 1) != 0) return;
+
+        try
+        {
+            _rwLock.EnterWriteLock();
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        try
+        {
+            if (_disposed) return;
+            Volatile.Write(ref _disposed, true);
+        }
+        finally
+        {
+            _rwLock.ExitWriteLock();
+            _rwLock.Dispose();
+        }
     }
 }
 
@@ -495,6 +627,8 @@ internal sealed class HnswSearchScratch
     public uint[] VisitedTags;
     public ValueMinHeap Candidates;
     public ValueMaxHeap Results;
+    public float[] VecBufA = Array.Empty<float>();
+    public float[] VecBufB = Array.Empty<float>();
 
     public HnswSearchScratch(int initialNodes = 1024, int initialCapacity = 256)
     {
@@ -502,6 +636,19 @@ internal sealed class HnswSearchScratch
         VisitedTags = new uint[initialNodes];
         Candidates = new ValueMinHeap(new (int, float)[initialCapacity]);
         Results = new ValueMaxHeap(new (int, float)[initialCapacity]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void EnsureVectorBuffers(int dimensions)
+    {
+        if (VecBufA.Length < dimensions)
+        {
+            VecBufA = new float[dimensions];
+        }
+        if (VecBufB.Length < dimensions)
+        {
+            VecBufB = new float[dimensions];
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

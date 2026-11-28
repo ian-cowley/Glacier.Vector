@@ -27,8 +27,14 @@
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Glacier.Gpu" Version="1.2.1" />
+  <PropertyGroup Condition="Exists('../../../Glacier.Gpu/src/Glacier.Gpu/Glacier.Gpu.csproj') and '$(UseLocalProjectReferences)' != 'false'">
+    <DefineConstants>$(DefineConstants);USE_LOCAL_GLACIER_GPU</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('../../../Glacier.Gpu/src/Glacier.Gpu/Glacier.Gpu.csproj') and '$(UseLocalProjectReferences)' != 'false'">
+    <ProjectReference Include="../../../Glacier.Gpu/src/Glacier.Gpu/Glacier.Gpu.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('../../../Glacier.Gpu/src/Glacier.Gpu/Glacier.Gpu.csproj') or '$(UseLocalProjectReferences)' == 'false'">
+    <PackageReference Include="Glacier.Gpu" />
   </ItemGroup>
 
   <ItemGroup>

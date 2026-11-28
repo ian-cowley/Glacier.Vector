@@ -7,9 +7,11 @@ using Xunit;
 
 namespace Glacier.Vector.Tests;
 
+[Collection("Gpu")]
 public class GpuVectorTests
 {
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void VectorIndex_Search_GpuMatchesCpuTopResults()
     {
         const int dims = 64;
@@ -71,6 +73,7 @@ public class GpuVectorTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void VectorIndex_BatchSearch_MatchesSingleQueries()
     {
         const int dims = 32;

@@ -305,42 +305,107 @@ public static class DistanceKernels
     /// Packs a dense FP32 vector into a 1-bit binary representation (x >= 0 ? 1 : 0),
     /// packing 64 floats into each 64-bit unsigned integer (ulong).
     /// </summary>
-    public static void PackBinaryVector(ReadOnlySpan<float> source, Span<ulong> destination)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static unsafe void PackBinaryVector(ReadOnlySpan<float> source, Span<ulong> destination)
     {
         int words = (source.Length + 63) / 64;
         if (destination.Length < words)
             throw new ArgumentException($"destination buffer too small. Needs {words} ulongs, got {destination.Length}.", nameof(destination));
 
+        if (words == 0) return;
         destination.Slice(0, words).Clear();
 
-        int fullWords = source.Length / 64;
-        for (int w = 0; w < fullWords; w++)
+        int fullWords = source.Length >> 6;
+        fixed (float* pSrc = source)
         {
-            ulong word = 0UL;
-            int offset = w * 64;
-            for (int b = 0; b < 64; b++)
+            int w = 0;
+            if (Avx512F.IsSupported && fullWords > 0)
             {
-                if (source[offset + b] >= 0.0f)
+                var zero512 = Vector512<float>.Zero;
+                for (; w < fullWords; w++)
                 {
-                    word |= (1UL << b);
+                    float* p = pSrc + (w << 6);
+                    ulong m0 = Vector512.GreaterThanOrEqual(Vector512.Load(p), zero512).ExtractMostSignificantBits();
+                    ulong m1 = Vector512.GreaterThanOrEqual(Vector512.Load(p + 16), zero512).ExtractMostSignificantBits();
+                    ulong m2 = Vector512.GreaterThanOrEqual(Vector512.Load(p + 32), zero512).ExtractMostSignificantBits();
+                    ulong m3 = Vector512.GreaterThanOrEqual(Vector512.Load(p + 48), zero512).ExtractMostSignificantBits();
+                    destination[w] = m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
                 }
             }
-            destination[w] = word;
-        }
+            else if (Avx.IsSupported && fullWords > 0)
+            {
+                var zero256 = Vector256<float>.Zero;
+                for (; w < fullWords; w++)
+                {
+                    float* p = pSrc + (w << 6);
+                    ulong m0 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p), zero256));
+                    ulong m1 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 8), zero256));
+                    ulong m2 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 16), zero256));
+                    ulong m3 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 24), zero256));
+                    ulong m4 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 32), zero256));
+                    ulong m5 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 40), zero256));
+                    ulong m6 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 48), zero256));
+                    ulong m7 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 56), zero256));
+                    destination[w] = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24)
+                                   | (m4 << 32) | (m5 << 40) | (m6 << 48) | (m7 << 56);
+                }
+            }
+            else if (Vector128.IsHardwareAccelerated && fullWords > 0)
+            {
+                var zero128 = Vector128<float>.Zero;
+                for (; w < fullWords; w++)
+                {
+                    float* p = pSrc + (w << 6);
+                    ulong word = 0UL;
+                    for (int s = 0; s < 16; s++)
+                    {
+                        ulong m = Vector128.GreaterThanOrEqual(Vector128.Load(p + (s << 2)), zero128).ExtractMostSignificantBits();
+                        word |= m << (s << 2);
+                    }
+                    destination[w] = word;
+                }
+            }
+            else
+            {
+                for (; w < fullWords; w++)
+                {
+                    ulong word = 0UL;
+                    float* p = pSrc + (w << 6);
+                    for (int b = 0; b < 64; b++)
+                    {
+                        if (p[b] >= 0.0f)
+                        {
+                            word |= 1UL << b;
+                        }
+                    }
+                    destination[w] = word;
+                }
+            }
 
-        int remainder = source.Length % 64;
-        if (remainder > 0)
-        {
-            ulong word = 0UL;
-            int offset = fullWords * 64;
-            for (int b = 0; b < remainder; b++)
+            int remainder = source.Length & 63;
+            if (remainder > 0)
             {
-                if (source[offset + b] >= 0.0f)
+                ulong word = 0UL;
+                float* pRem = pSrc + (fullWords << 6);
+                int b = 0;
+                if (Vector128.IsHardwareAccelerated)
                 {
-                    word |= (1UL << b);
+                    var zero128 = Vector128<float>.Zero;
+                    for (; b <= remainder - 4; b += 4)
+                    {
+                        ulong m = Vector128.GreaterThanOrEqual(Vector128.Load(pRem + b), zero128).ExtractMostSignificantBits();
+                        word |= m << b;
+                    }
                 }
+                for (; b < remainder; b++)
+                {
+                    if (pRem[b] >= 0.0f)
+                    {
+                        word |= 1UL << b;
+                    }
+                }
+                destination[fullWords] = word;
             }
-            destination[fullWords] = word;
         }
     }
 
@@ -348,42 +413,100 @@ public static class DistanceKernels
     /// Packs a dense FP32 vector into a 1-bit binary representation (x >= 0 ? 1 : 0),
     /// packing 32 floats into each 32-bit unsigned integer (uint).
     /// </summary>
-    public static void PackBinaryVector(ReadOnlySpan<float> source, Span<uint> destination)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static unsafe void PackBinaryVector(ReadOnlySpan<float> source, Span<uint> destination)
     {
         int words = (source.Length + 31) / 32;
         if (destination.Length < words)
             throw new ArgumentException($"destination buffer too small. Needs {words} uints, got {destination.Length}.", nameof(destination));
 
+        if (words == 0) return;
         destination.Slice(0, words).Clear();
 
-        int fullWords = source.Length / 32;
-        for (int w = 0; w < fullWords; w++)
+        int fullWords = source.Length >> 5;
+        fixed (float* pSrc = source)
         {
-            uint word = 0U;
-            int offset = w * 32;
-            for (int b = 0; b < 32; b++)
+            int w = 0;
+            if (Avx512F.IsSupported && fullWords > 0)
             {
-                if (source[offset + b] >= 0.0f)
+                var zero512 = Vector512<float>.Zero;
+                for (; w < fullWords; w++)
                 {
-                    word |= (1U << b);
+                    float* p = pSrc + (w << 5);
+                    uint m0 = (uint)Vector512.GreaterThanOrEqual(Vector512.Load(p), zero512).ExtractMostSignificantBits();
+                    uint m1 = (uint)Vector512.GreaterThanOrEqual(Vector512.Load(p + 16), zero512).ExtractMostSignificantBits();
+                    destination[w] = m0 | (m1 << 16);
                 }
             }
-            destination[w] = word;
-        }
+            else if (Avx.IsSupported && fullWords > 0)
+            {
+                var zero256 = Vector256<float>.Zero;
+                for (; w < fullWords; w++)
+                {
+                    float* p = pSrc + (w << 5);
+                    uint m0 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p), zero256));
+                    uint m1 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 8), zero256));
+                    uint m2 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 16), zero256));
+                    uint m3 = (uint)Avx.MoveMask(Avx.CompareGreaterThanOrEqual(Vector256.Load(p + 24), zero256));
+                    destination[w] = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
+                }
+            }
+            else if (Vector128.IsHardwareAccelerated && fullWords > 0)
+            {
+                var zero128 = Vector128<float>.Zero;
+                for (; w < fullWords; w++)
+                {
+                    float* p = pSrc + (w << 5);
+                    uint word = 0U;
+                    for (int s = 0; s < 8; s++)
+                    {
+                        uint m = (uint)Vector128.GreaterThanOrEqual(Vector128.Load(p + (s << 2)), zero128).ExtractMostSignificantBits();
+                        word |= m << (s << 2);
+                    }
+                    destination[w] = word;
+                }
+            }
+            else
+            {
+                for (; w < fullWords; w++)
+                {
+                    uint word = 0U;
+                    float* p = pSrc + (w << 5);
+                    for (int b = 0; b < 32; b++)
+                    {
+                        if (p[b] >= 0.0f)
+                        {
+                            word |= 1U << b;
+                        }
+                    }
+                    destination[w] = word;
+                }
+            }
 
-        int remainder = source.Length % 32;
-        if (remainder > 0)
-        {
-            uint word = 0U;
-            int offset = fullWords * 32;
-            for (int b = 0; b < remainder; b++)
+            int remainder = source.Length & 31;
+            if (remainder > 0)
             {
-                if (source[offset + b] >= 0.0f)
+                uint word = 0U;
+                float* pRem = pSrc + (fullWords << 5);
+                int b = 0;
+                if (Vector128.IsHardwareAccelerated)
                 {
-                    word |= (1U << b);
+                    var zero128 = Vector128<float>.Zero;
+                    for (; b <= remainder - 4; b += 4)
+                    {
+                        uint m = (uint)Vector128.GreaterThanOrEqual(Vector128.Load(pRem + b), zero128).ExtractMostSignificantBits();
+                        word |= m << b;
+                    }
                 }
+                for (; b < remainder; b++)
+                {
+                    if (pRem[b] >= 0.0f)
+                    {
+                        word |= 1U << b;
+                    }
+                }
+                destination[fullWords] = word;
             }
-            destination[fullWords] = word;
         }
     }
 

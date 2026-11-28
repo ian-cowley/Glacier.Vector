@@ -5,6 +5,7 @@ using Xunit;
 
 namespace Glacier.Vector.Tests;
 
+[Collection("Gpu")]
 public class HadamardAndQuantizedKernelTests
 {
     // =========================================================================
@@ -349,6 +350,7 @@ public class HadamardAndQuantizedKernelTests
     // =========================================================================
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void GpuVectorAccelerator_SplitK_FP32_HighDim_MatchesCpuExactly()
     {
         const int dims = 512; // >= 128 triggers vector_dot_scan_splitk_fp32 on NVIDIA GPU
@@ -380,6 +382,7 @@ public class HadamardAndQuantizedKernelTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void GpuVectorAccelerator_Int8Dp4a_MatchesCpuQuantizedDot()
     {
         const int dims = 256;

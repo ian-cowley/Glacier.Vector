@@ -1,16 +1,18 @@
 using System;
 using System.IO;
-using Xunit;
-using Glacier.Vector.Storage;
+using Glacier.Vector.Compute;
+using Glacier.Vector.Core;
 using Glacier.Vector.Index;
+using Glacier.Vector.Storage;
+using Xunit;
 
 namespace Glacier.Vector.Tests
 {
-    public class UnitTest1 : IDisposable
+    public class PagedStorageAndVectorIndexTests : IDisposable
     {
         private readonly string _tempFile;
 
-        public UnitTest1()
+        public PagedStorageAndVectorIndexTests()
         {
             _tempFile = Path.Combine(Path.GetTempPath(), $"glacier_vector_test_{Guid.NewGuid():N}.bin");
         }
@@ -108,8 +110,8 @@ namespace Glacier.Vector.Tests
                 expectedL2 += diff * diff;
             }
 
-            float actualDot = Glacier.Vector.Compute.DistanceKernels.DotProduct(a, b);
-            float actualL2 = Glacier.Vector.Compute.DistanceKernels.L2DistanceSquared(a, b);
+            float actualDot = DistanceKernels.DotProduct(a, b);
+            float actualL2 = DistanceKernels.L2DistanceSquared(a, b);
 
             Assert.True(Math.Abs(actualDot - (float)expectedDot) < 1e-4f,
                 $"DotProduct mismatch: expected {expectedDot:F6}, got {actualDot:F6}");
@@ -120,23 +122,23 @@ namespace Glacier.Vector.Tests
         [Fact]
         public void TestVectorConcurrency()
         {
-            int initial = Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism;
+            int initial = VectorConcurrency.MaxDegreeOfParallelism;
             try
             {
-                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = 0;
-                Assert.True(Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism() >= 1);
+                VectorConcurrency.MaxDegreeOfParallelism = 0;
+                Assert.True(VectorConcurrency.GetEffectiveParallelism() >= 1);
 
-                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = 4;
-                Assert.Equal(Math.Min(4, Environment.ProcessorCount), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism());
+                VectorConcurrency.MaxDegreeOfParallelism = 4;
+                Assert.Equal(Math.Min(4, Environment.ProcessorCount), VectorConcurrency.GetEffectiveParallelism());
 
-                Assert.Equal(Math.Min(2, Environment.ProcessorCount), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism(requested: 2));
+                Assert.Equal(Math.Min(2, Environment.ProcessorCount), VectorConcurrency.GetEffectiveParallelism(requested: 2));
 
-                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = -1;
-                Assert.Equal(Math.Max(1, Environment.ProcessorCount - 2), Glacier.Vector.Core.VectorConcurrency.GetEffectiveParallelism());
+                VectorConcurrency.MaxDegreeOfParallelism = -1;
+                Assert.Equal(Math.Max(1, Environment.ProcessorCount - 2), VectorConcurrency.GetEffectiveParallelism());
             }
             finally
             {
-                Glacier.Vector.Core.VectorConcurrency.MaxDegreeOfParallelism = initial;
+                VectorConcurrency.MaxDegreeOfParallelism = initial;
             }
         }
 

@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Glacier.Vector.Benchmarks/Glacier.Vector.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/Glacier.Vector.Demo/Glacier.Vector.Demo.csproj" />
   </Folder>
